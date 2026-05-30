@@ -310,7 +310,10 @@ actor SessionState {
       throw RTSPError.connectionFailed("Invalid URL: \(url)")
     }
     let host = urlComponents.host ?? "localhost"
-    let port = UInt16(urlComponents.port ?? 554)
+    let rawPort = urlComponents.port ?? 554
+    guard let port = UInt16(exactly: rawPort) else {
+      throw RTSPError.connectionFailed("Invalid port \(rawPort) in URL: \(url)")
+    }
 
     self.userAgent = userAgent
 
@@ -571,16 +574,32 @@ actor SessionState {
           if let s = init_.ssrc { resolvedAudioSsrc = s }
         }
 
-        let audioTimeline = try Timeline(
-          start: audioStart, clockRate: audioStream.clockRateHz)
-        inorderParsers[audioIdx] = InorderParser(
-          ssrc: resolvedAudioSsrc, nextSeq: audioSeq,
-          isTcp: transport == .tcp, timeline: audioTimeline,
-          onDiagnostic: onDiagnostic)
-        resolvedAudioCodec = publicAudioCodec(
-          from: audioStream.encodingName)
-        resolvedAudioRate = audioStream.clockRateHz
-        resolvedAudioChannels = audioStream.channels
+        do {
+          let audioTimeline = try Timeline(
+            start: audioStart, clockRate: audioStream.clockRateHz)
+          inorderParsers[audioIdx] = InorderParser(
+            ssrc: resolvedAudioSsrc, nextSeq: audioSeq,
+            isTcp: transport == .tcp, timeline: audioTimeline,
+            onDiagnostic: onDiagnostic)
+          resolvedAudioCodec = publicAudioCodec(
+            from: audioStream.encodingName)
+          resolvedAudioRate = audioStream.clockRateHz
+          resolvedAudioChannels = audioStream.channels
+        } catch {
+          // Audio is best-effort: a broken clock rate must not abort the
+          // whole session. Disable audio and carry on (mirrors metadata).
+          onDiagnostic?(
+            RTSPDiagnostic(
+              severity: .warning,
+              message:
+                "Failed to initialize audio timeline: \(error); "
+                + "audio will not be delivered."))
+          audioDepacketizer = nil
+          audioStreamIndex = nil
+          audioEncodingName = nil
+          audioClockRate = nil
+          audioChannels = nil
+        }
       } else {
         // Audio SETUP succeeded but the depacketizer rejected the format
         // (e.g. malformed AAC fmtp). Null the audio state so packets on
@@ -890,6 +909,10 @@ actor SessionState {
         let retryResp = try await conn.sendRequest(retryRequest)
         if retryResp.statusCode == 401 {
           throw RTSPError.authenticationFailed
+        }
+        guard retryResp.statusCode >= 200 && retryResp.statusCode < 300 else {
+          throw RTSPError.sessionSetupFailed(
+            statusCode: Int(retryResp.statusCode), reason: retryResp.reasonPhrase)
         }
         return retryResp
       }
