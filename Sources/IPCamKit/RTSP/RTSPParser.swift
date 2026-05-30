@@ -11,6 +11,13 @@ import Foundation
 ///
 /// Mirrors the parsing logic in upstream tokio.rs Codec::parse_msg.
 public struct RTSPParser: Sendable {
+  /// Maximum RTSP message body (`Content-Length`) we will accept. RTSP bodies —
+  /// SDP, `GET_PARAMETER` lists — are KB-scale; this is generous headroom that
+  /// still rejects a hostile/absurd `Content-Length` before any of it is
+  /// buffered (memory-DoS guard). Kept below `RTSPTransportConnection`'s read
+  /// buffer cap so a body this size still frames before the connection trips.
+  static let maxBodyBytes = 2 * 1024 * 1024
+
   public init() {}
 
   /// Attempts to parse one RTSP message from the given buffer.
@@ -81,9 +88,12 @@ public struct RTSPParser: Sendable {
       throw RTSPError.depacketizationError("Invalid UTF-8 in RTSP response headers")
     }
 
-    var lines = headerString.split(
-      separator: "\r\n", omittingEmptySubsequences: false
-    ).map(String.init)
+    // Split on either a CRLF (per RFC) or a bare LF (sloppy cameras/proxies).
+    // Swift fuses "\r\n" into one grapheme `Character`, so splitting on a lone
+    // "\n" would miss CRLF lines — match both grapheme separators explicitly.
+    var lines = headerString.split(omittingEmptySubsequences: false) {
+      $0 == "\n" || $0 == "\r\n"
+    }.map(String.init)
 
     guard !lines.isEmpty else {
       throw RTSPError.depacketizationError("Empty RTSP response")
@@ -98,10 +108,17 @@ public struct RTSPParser: Sendable {
     for line in lines {
       if line.isEmpty { continue }
       if let colonIdx = line.firstIndex(of: ":") {
+        // Trim the field name as well as the value: some cameras emit
+        // "CSeq : 1" with space before the colon. Lookups lowercase the name
+        // but don't trim, so an untrimmed "CSeq " would never match "cseq" and
+        // CSeq-based response routing would silently break. Trim newlines too,
+        // so a stray CR from a mixed CRLF-headers/bare-LF-terminator boundary
+        // (e.g. "...CSeq: 1\r\n\n") never leaves "1\r" and breaks numeric parses.
         let name = String(line[line.startIndex..<colonIdx])
+          .trimmingCharacters(in: .whitespacesAndNewlines)
         let valueStart = line.index(after: colonIdx)
         let value = String(line[valueStart...]).trimmingCharacters(
-          in: CharacterSet(charactersIn: " \t"))
+          in: .whitespacesAndNewlines)
         headers.append((name, value))
       }
     }
@@ -113,6 +130,11 @@ public struct RTSPParser: Sendable {
     if let cl = contentLengthKey {
       guard let len = Int(cl.1.trimmingCharacters(in: .whitespaces)), len >= 0 else {
         throw RTSPError.depacketizationError("Invalid Content-Length: \(cl.1)")
+      }
+      // Reject an absurd declared body up front so we never try to buffer it.
+      guard len <= Self.maxBodyBytes else {
+        throw RTSPError.depacketizationError(
+          "Content-Length too large: \(len) (max \(Self.maxBodyBytes))")
       }
       bodyLength = len
     }
@@ -146,15 +168,20 @@ public struct RTSPParser: Sendable {
   /// Parse "RTSP/1.0 200 OK" into components.
   func parseStatusLine(_ line: String) throws -> (String, UInt16, String) {
     // Split into at most 3 parts: version, status code, reason phrase.
-    // Collapse repeated spaces (some cameras/proxies emit "RTSP/1.0  200 OK")
-    // so the status code is read from the right field.
-    let parts = line.split(separator: " ", maxSplits: 2, omittingEmptySubsequences: true)
+    // Separate on runs of spaces/tabs so a doubled space ("RTSP/1.0  200 OK")
+    // or the odd tab-delimited camera still reads the code from the right field.
+    let parts = line.split(
+      maxSplits: 2, omittingEmptySubsequences: true,
+      whereSeparator: { $0 == " " || $0 == "\t" })
     guard parts.count >= 2 else {
       throw RTSPError.depacketizationError("Invalid RTSP status line: \(line)")
     }
 
     let version = String(parts[0])
-    guard let statusCode = UInt16(parts[1]) else {
+    // Read the leading ASCII digits of the code field so trailing junk on the
+    // status code doesn't abort an otherwise usable connection.
+    let digits = parts[1].prefix(while: { $0.isASCII && $0.isNumber })
+    guard let statusCode = UInt16(digits) else {
       throw RTSPError.depacketizationError("Invalid status code in: \(line)")
     }
     let reasonPhrase = parts.count >= 3 ? String(parts[2]) : ""
@@ -162,18 +189,30 @@ public struct RTSPParser: Sendable {
     return (version, statusCode, reasonPhrase)
   }
 
-  /// Find the position of "\r\n\r\n" in the data, returning the range of the double CRLF.
-  /// The lowerBound is the start of the first \r\n, the upperBound is after the second \r\n.
+  /// Find the header/body boundary (the blank line) and return its byte range:
+  /// `lowerBound` is the start of the terminating line break, `upperBound` the
+  /// first body byte. Recognizes `\r\n\r\n` (per RFC) and, for sloppy cameras,
+  /// a bare `\n\n`. Scans the `Data` in place via `withUnsafeBytes` — no
+  /// per-call full-buffer copy — so repeated calls as a body streams in stay
+  /// O(n) overall rather than O(n^2).
   func findDoubleCRLF(in data: Data) -> Range<Int>? {
-    let bytes = [UInt8](data)
-    guard bytes.count >= 4 else { return nil }
-    for i in 0...(bytes.count - 4) {
-      if bytes[i] == 0x0D && bytes[i + 1] == 0x0A
-        && bytes[i + 2] == 0x0D && bytes[i + 3] == 0x0A
-      {
-        return (data.startIndex + i)..<(data.startIndex + i + 4)
+    let start = data.startIndex
+    return data.withUnsafeBytes { (raw: UnsafeRawBufferPointer) -> Range<Int>? in
+      let n = raw.count
+      guard n >= 2 else { return nil }
+      var i = 0
+      while i < n - 1 {
+        if raw[i] == 0x0A && raw[i + 1] == 0x0A {
+          return (start + i)..<(start + i + 2)  // bare LF + LF
+        }
+        if i + 3 < n && raw[i] == 0x0D && raw[i + 1] == 0x0A
+          && raw[i + 2] == 0x0D && raw[i + 3] == 0x0A
+        {
+          return (start + i)..<(start + i + 4)  // CR LF CR LF
+        }
+        i += 1
       }
+      return nil
     }
-    return nil
   }
 }

@@ -119,6 +119,83 @@ struct RTSPParserTests {
     #expect(resp.statusCode == 200)
   }
 
+  @Test("Tolerate space before the header colon (CSeq : 7)")
+  func spacedHeaderName() throws {
+    var data = Data(
+      "RTSP/1.0 200 OK\r\nCSeq : 7\r\nSession : 12345;timeout=60\r\n\r\n".utf8)
+    let result = try parser.parse(&data)
+    guard case .response(let resp) = result?.0 else {
+      Issue.record("Expected response")
+      return
+    }
+    // Without trimming the field name, "CSeq " never matches "cseq" and
+    // response routing breaks. See finding #3.
+    #expect(resp.cseq == 7)
+    #expect(resp.header("Session") == "12345;timeout=60")
+  }
+
+  @Test("Parse response with bare-LF line endings")
+  func bareLFResponse() throws {
+    var data = Data("RTSP/1.0 200 OK\nCSeq: 3\nContent-Length: 4\n\nbody".utf8)
+    let result = try parser.parse(&data)
+    guard case .response(let resp) = result?.0 else {
+      Issue.record("Expected response")
+      return
+    }
+    #expect(resp.statusCode == 200)
+    #expect(resp.cseq == 3)
+    #expect(resp.body == Data("body".utf8))
+    #expect(data.isEmpty)
+  }
+
+  @Test("Mixed CRLF headers with a bare-LF terminator parse cleanly")
+  func mixedCRLFBareLFTerminator() throws {
+    // CRLF header lines, but the blank line is a bare LF ("...10\r\n\n"). The
+    // boundary must not leave a trailing CR on the last header value, which
+    // would break numeric parses (Content-Length here) and tear down the stream.
+    var data = Data(
+      "RTSP/1.0 200 OK\r\nCSeq: 4\r\nContent-Length: 10\r\n\nABCDEFGHIJ".utf8)
+    let result = try parser.parse(&data)
+    guard case .response(let resp) = result?.0 else {
+      Issue.record("Expected response")
+      return
+    }
+    #expect(resp.cseq == 4)
+    #expect(resp.contentLength == 10)
+    #expect(resp.body == Data("ABCDEFGHIJ".utf8))
+    #expect(data.isEmpty)
+  }
+
+  @Test("Tolerate tab-delimited status line and trailing junk on the code")
+  func lenientStatusLine() throws {
+    var data1 = Data("RTSP/1.0\t200\tOK\r\nCSeq: 1\r\n\r\n".utf8)
+    let result1 = try parser.parse(&data1)
+    guard case .response(let r1) = result1?.0 else {
+      Issue.record("Expected response")
+      return
+    }
+    #expect(r1.statusCode == 200)
+    #expect(r1.reasonPhrase == "OK")
+
+    var data2 = Data("RTSP/1.0 404Whatever Not Found\r\nCSeq: 1\r\n\r\n".utf8)
+    let result2 = try parser.parse(&data2)
+    guard case .response(let r2) = result2?.0 else {
+      Issue.record("Expected response")
+      return
+    }
+    #expect(r2.statusCode == 404)
+    #expect(r2.reasonPhrase == "Not Found")
+  }
+
+  @Test("Reject an absurd Content-Length instead of buffering it")
+  func rejectHugeContentLength() {
+    var data = Data(
+      "RTSP/1.0 200 OK\r\nCSeq: 1\r\nContent-Length: 999999999\r\n\r\n".utf8)
+    #expect(throws: RTSPError.self) {
+      _ = try parser.parse(&data)
+    }
+  }
+
   // MARK: - Interleaved Data Parsing
 
   @Test("Parse interleaved data frame")
@@ -161,6 +238,21 @@ struct RTSPParserTests {
     var data = Data([0x24, 0x00, 0x00, 0x08, 0x01, 0x02])  // Need 8 bytes but only have 2
     let result = try parser.parse(&data)
     #expect(result == nil)
+  }
+
+  @Test("Max-size interleaved frame parses")
+  func maxInterleavedFrame() throws {
+    let payload = Data(repeating: 0xAB, count: 0xFFFF)
+    var data = Data([0x24, 0x05, 0xFF, 0xFF])  // '$' + channel 5 + length 0xFFFF
+    data.append(payload)
+    let result = try parser.parse(&data)
+    guard case .data(let interleaved) = result?.0 else {
+      Issue.record("Expected interleaved data")
+      return
+    }
+    #expect(interleaved.channelId == 5)
+    #expect(interleaved.data.count == 0xFFFF)
+    #expect(data.isEmpty)
   }
 
   // MARK: - Serialization

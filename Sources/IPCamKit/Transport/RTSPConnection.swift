@@ -19,6 +19,13 @@ actor RTSPTransportConnection {
   private var readBuffer = Data()
   private var connectionContext: ConnectionContext?
 
+  /// Hard cap on the unparsed read buffer. A peer that never frames a message —
+  /// no header terminator, or a `$`-interleaved frame whose length is never
+  /// satisfied — would otherwise grow this without bound (memory-DoS). A full
+  /// interleaved frame is at most ~64 KiB and an RTSP message body is capped at
+  /// `RTSPParser.maxBodyBytes`, so this leaves wide headroom for any real camera.
+  private static let maxReadBufferBytes = 4 * 1024 * 1024
+
   /// Maximum time to wait for the TCP connection to become ready. NWConnection
   /// has no built-in connect deadline, so a half-open server would otherwise
   /// hang `connect()` forever.
@@ -129,6 +136,14 @@ actor RTSPTransportConnection {
       if let (msg, _) = try parser.parse(&bufferCopy) {
         readBuffer = bufferCopy
         return msg
+      }
+
+      // No complete message yet. Bound the buffer before reading more so a peer
+      // that never frames a message can't exhaust memory. Checked here (after
+      // the parse attempt) so a message that just completed still parses.
+      guard readBuffer.count <= Self.maxReadBufferBytes else {
+        throw RTSPError.connectionFailed(
+          "RTSP read buffer exceeded \(Self.maxReadBufferBytes) bytes without a complete message")
       }
 
       // Need more data
