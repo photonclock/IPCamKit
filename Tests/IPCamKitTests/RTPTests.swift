@@ -419,6 +419,74 @@ struct InorderParserTests {
     let recv = try parser.rtp(data: rtp, ctx: .dummy, streamId: 0, streamCtx: .dummy)
     #expect(recv?.timestamp.elapsed == 0)
   }
+
+  /// A malformed RTP datagram is dropped (with a single warning), never fatal —
+  /// one bad packet must not tear down the stream (finding #1).
+  @Test("Malformed RTP packet is dropped, not fatal")
+  func malformedRtpDropped() throws {
+    let captured = DiagnosticBox()
+    let timeline = try Timeline(start: nil, clockRate: 90_000, enforceMaxJumpSecs: nil)
+    var parser = InorderParser(
+      ssrc: nil, nextSeq: nil, isTcp: true, timeline: timeline,
+      onDiagnostic: { captured.append($0) })
+
+    // Fewer than 12 bytes is not a valid RTP packet -> RawRTPPacket.parse fails.
+    #expect(
+      try parser.rtp(data: Data([0x80, 0x60]), ctx: .dummy, streamId: 0, streamCtx: .dummy) == nil)
+    #expect(captured.events.count == 1)
+    #expect(captured.events.first?.severity == .warning)
+
+    // A second malformed packet drops silently (latched).
+    #expect(try parser.rtp(data: Data([0x80]), ctx: .dummy, streamId: 0, streamCtx: .dummy) == nil)
+    #expect(captured.events.count == 1)
+
+    // A subsequent valid packet still processes.
+    let good = try RTPPacketBuilder(
+      sequenceNumber: 5, timestamp: 100, payloadType: 96, ssrc: 0x1111_2222, mark: true
+    ).build(payload: Data("ok".utf8)).get().data
+    #expect(try parser.rtp(data: good, ctx: .dummy, streamId: 0, streamCtx: .dummy) != nil)
+  }
+
+  /// An RTP SSRC mismatch drops by default, throws only under .abortSession, and
+  /// is accepted under .processPackets (finding #1).
+  @Test("RTP SSRC mismatch is policy-gated")
+  func rtpSsrcMismatchPolicies() throws {
+    func makeParser(_ policy: UnknownRtcpSsrcPolicy, _ box: DiagnosticBox) throws -> InorderParser {
+      let tl = try Timeline(start: nil, clockRate: 90_000, enforceMaxJumpSecs: nil)
+      return InorderParser(
+        ssrc: 0xAAAA_AAAA, nextSeq: nil, isTcp: false, timeline: tl,
+        unknownRtcpSsrcPolicy: policy, onDiagnostic: { box.append($0) })
+    }
+    func packet(ssrc: UInt32) -> Data {
+      try! RTPPacketBuilder(
+        sequenceNumber: 1, timestamp: 1, payloadType: 96, ssrc: ssrc, mark: true
+      ).build(payload: Data("x".utf8)).get().data
+    }
+
+    // dropPackets: mismatch dropped + warned once; matching SSRC still processes.
+    let dropBox = DiagnosticBox()
+    var dropParser = try makeParser(.dropPackets, dropBox)
+    #expect(
+      try dropParser.rtp(
+        data: packet(ssrc: 0xDEAD_BEEF), ctx: .dummy, streamId: 0, streamCtx: .dummy) == nil)
+    #expect(dropBox.events.count == 1)
+    #expect(
+      try dropParser.rtp(
+        data: packet(ssrc: 0xAAAA_AAAA), ctx: .dummy, streamId: 0, streamCtx: .dummy) != nil)
+
+    // abortSession: mismatch throws.
+    var abortParser = try makeParser(.abortSession, DiagnosticBox())
+    #expect(throws: RTSPError.self) {
+      _ = try abortParser.rtp(
+        data: packet(ssrc: 0xDEAD_BEEF), ctx: .dummy, streamId: 0, streamCtx: .dummy)
+    }
+
+    // processPackets: mismatch accepted.
+    var processParser = try makeParser(.processPackets, DiagnosticBox())
+    #expect(
+      try processParser.rtp(
+        data: packet(ssrc: 0xDEAD_BEEF), ctx: .dummy, streamId: 0, streamCtx: .dummy) != nil)
+  }
 }
 
 /// Build a minimal RTCP Sender Report (PT=200, no report blocks) for tests.

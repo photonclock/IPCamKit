@@ -546,7 +546,10 @@ actor SessionState {
 
       if case .setup(let init_) = presMut.streams[videoIdx].state {
         videoStart = init_.initialRtptime
-        if let seq = init_.initialSeq, seq != 0, seq != 1 {
+        // Adopt the RTP-Info initial sequence so loss before the first received
+        // packet is detected. Only ignore the `seq=0;rtptime=0` placeholder some
+        // cameras emit instead of a real seed (finding #50).
+        if let seq = init_.initialSeq, !(seq == 0 && (init_.initialRtptime ?? 0) == 0) {
           videoSeq = seq
         }
         if let s = init_.ssrc { videoSsrc = s }
@@ -579,7 +582,8 @@ actor SessionState {
 
         if case .setup(let init_) = presMut.streams[audioIdx].state {
           audioStart = init_.initialRtptime
-          if let seq = init_.initialSeq, seq != 0, seq != 1 {
+          // See the video seed above (finding #50): only the placeholder is ignored.
+          if let seq = init_.initialSeq, !(seq == 0 && (init_.initialRtptime ?? 0) == 0) {
             audioSeq = seq
           }
           if let s = init_.ssrc { resolvedAudioSsrc = s }
@@ -642,7 +646,8 @@ actor SessionState {
 
       if case .setup(let init_) = presMut.streams[applicationIdx].state {
         applicationStart = init_.initialRtptime
-        if let seq = init_.initialSeq, seq != 0, seq != 1 {
+        // See the video seed above (finding #50): only the placeholder is ignored.
+        if let seq = init_.initialSeq, !(seq == 0 && (init_.initialRtptime ?? 0) == 0) {
           applicationSeq = seq
         }
         if let s = init_.ssrc { resolvedApplicationSsrc = s }
@@ -875,9 +880,24 @@ actor SessionState {
     udpControlError = error
   }
 
+  /// One-shot latch keys for per-stream conditions that can recur per packet or
+  /// per frame, so a sloppy/hostile camera can't flood `onDiagnostic`.
+  private var warnedStreamConditions: Set<String> = []
+
+  /// Emit `message` only the first time `key` is seen this session.
+  private func warnStreamOnce(
+    _ key: String, _ severity: RTSPDiagnostic.Severity, _ message: @autoclosure () -> String
+  ) {
+    guard warnedStreamConditions.insert(key).inserted else { return }
+    onDiagnostic?(RTSPDiagnostic(severity: severity, message: message()))
+  }
+
   /// Route one RTP packet to its stream's depacketizer, yielding any completed
   /// frames. Shared by the TCP and UDP reader loops; a missing parser or
-  /// depacketizer (a disabled stream) drops the packet.
+  /// depacketizer (a disabled stream) drops the packet. A malformed wire packet
+  /// or a per-frame depacketization failure drops that packet/frame and emits a
+  /// rate-limited diagnostic rather than tearing down the whole stream — only
+  /// the opt-in `.abortSession` SSRC policy still propagates fatally.
   private func routeRTP(
     streamIndex: Int, data: Data,
     continuation: AsyncThrowingStream<PublicCodecItem, Error>.Continuation
@@ -887,83 +907,97 @@ actor SessionState {
 
     if let videoIdx = videoStreamIndex, streamIndex == videoIdx {
       guard var depkt = depacketizer else { return }
-      if let pkt = try parser.rtp(
-        data: data, ctx: .dummy, streamId: streamIndex, streamCtx: .dummy)
-      {
-        if pkt.payload.isEmpty {
-          onDiagnostic?(
-            RTSPDiagnostic(
-              severity: .warning,
-              message: "Empty video RTP payload from camera; packet skipped."))
-        }
-        do {
-          try depkt.push(pkt)
-        } catch {
-          throw RTSPError.depacketizationError("Video push failed: \(error)")
-        }
-        while let result = depkt.pull() {
-          switch result {
-          case .success(.videoFrame(let frame)):
-            let publicFrame = convertFrame(frame, depacketizer: depkt)
-            continuation.yield(.video(publicFrame))
-          case .failure(let err):
-            throw RTSPError.depacketizationError("Video depacketization failed: \(err)")
-          default:
-            break
-          }
+      defer { depacketizer = depkt }
+      guard
+        let pkt = try parser.rtp(
+          data: data, ctx: .dummy, streamId: streamIndex, streamCtx: .dummy)
+      else { return }
+      if pkt.payload.isEmpty {
+        warnStreamOnce(
+          "video.empty", .warning, "Empty video RTP payload from camera; packets skipped.")
+      }
+      do {
+        try depkt.push(pkt)
+      } catch {
+        warnStreamOnce(
+          "video.push", .error, "Video depacketizer push failed; packet dropped: \(error)")
+        return
+      }
+      while let result = depkt.pull() {
+        switch result {
+        case .success(.videoFrame(let frame)):
+          continuation.yield(.video(convertFrame(frame, depacketizer: depkt)))
+        case .failure(let err):
+          warnStreamOnce(
+            "video.pull", .error, "Video depacketization failed; frame dropped: \(err)")
+        default:
+          break
         }
       }
-      depacketizer = depkt
     } else if let audioIdx = audioStreamIndex, streamIndex == audioIdx {
       guard var depkt = audioDepacketizer else { return }
-      if let pkt = try parser.rtp(
-        data: data, ctx: .dummy, streamId: streamIndex, streamCtx: .dummy)
-      {
+      defer { audioDepacketizer = depkt }
+      guard
+        let pkt = try parser.rtp(
+          data: data, ctx: .dummy, streamId: streamIndex, streamCtx: .dummy)
+      else { return }
+      do {
         try depkt.push(pkt)
-        while let result = depkt.pull() {
-          switch result {
-          case .success(.audioFrame(let frame)):
-            let publicFrame = PublicAudioFrame(
-              data: frame.data,
-              timestamp: frame.timestamp.elapsedSeconds,
-              codec: publicAudioCodec(from: audioEncodingName ?? ""),
-              sampleRate: audioClockRate ?? 0,
-              channels: audioChannels,
-              loss: frame.loss
-            )
-            continuation.yield(.audio(publicFrame))
-          case .failure(let err):
-            throw RTSPError.depacketizationError("Audio depacketization failed: \(err)")
-          default:
-            break
-          }
+      } catch {
+        warnStreamOnce(
+          "audio.push", .error, "Audio depacketizer push failed; packet dropped: \(error)")
+        return
+      }
+      while let result = depkt.pull() {
+        switch result {
+        case .success(.audioFrame(let frame)):
+          continuation.yield(
+            .audio(
+              PublicAudioFrame(
+                data: frame.data,
+                timestamp: frame.timestamp.elapsedSeconds,
+                codec: publicAudioCodec(from: audioEncodingName ?? ""),
+                sampleRate: audioClockRate ?? 0,
+                channels: audioChannels,
+                loss: frame.loss)))
+        case .failure(let err):
+          warnStreamOnce(
+            "audio.pull", .error, "Audio depacketization failed; frame dropped: \(err)")
+        default:
+          break
         }
       }
-      audioDepacketizer = depkt
     } else if let applicationIdx = applicationStreamIndex, streamIndex == applicationIdx {
       guard var depkt = applicationDepacketizer else { return }
-      if let pkt = try parser.rtp(
-        data: data, ctx: .dummy, streamId: streamIndex, streamCtx: .dummy)
-      {
+      defer { applicationDepacketizer = depkt }
+      guard
+        let pkt = try parser.rtp(
+          data: data, ctx: .dummy, streamId: streamIndex, streamCtx: .dummy)
+      else { return }
+      do {
         try depkt.push(pkt)
-        while let result = depkt.pull() {
-          switch result {
-          case .success(.metadataFrame(let frame)):
-            let publicFrame = PublicMetadataFrame(
-              data: frame.data,
-              timestamp: frame.timestamp.elapsedSeconds,
-              encodingName: applicationEncodingName ?? "",
-              loss: frame.loss
-            )
-            continuation.yield(.metadata(publicFrame))
-          case .failure(let err):
-            throw RTSPError.depacketizationError("Metadata depacketization failed: \(err)")
-          default:
-            break
-          }
+      } catch {
+        warnStreamOnce(
+          "metadata.push", .error, "Metadata depacketizer push failed; packet dropped: \(error)")
+        return
+      }
+      while let result = depkt.pull() {
+        switch result {
+        case .success(.metadataFrame(let frame)):
+          continuation.yield(
+            .metadata(
+              PublicMetadataFrame(
+                data: frame.data,
+                timestamp: frame.timestamp.elapsedSeconds,
+                encodingName: applicationEncodingName ?? "",
+                loss: frame.loss)))
+        case .failure(let err):
+          warnStreamOnce(
+            "metadata.pull", .error, "Metadata depacketization failed; frame dropped: \(err)")
+        default:
+          break
         }
       }
-      applicationDepacketizer = depkt
     }
   }
 
