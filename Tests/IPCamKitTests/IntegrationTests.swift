@@ -25,7 +25,7 @@ struct IntegrationTests {
     #expect(depacketizer.parameters!.genericParameters.pixelDimensions?.height == 360)
 
     // Create timeline and inorder parser
-    var timeline = try Timeline(start: nil, clockRate: clockRate, enforceMaxJumpSecs: 10)
+    let timeline = try Timeline(start: nil, clockRate: clockRate, enforceMaxJumpSecs: 10)
     var parser = InorderParser(
       ssrc: nil, nextSeq: nil, isTcp: true, timeline: timeline)
 
@@ -110,7 +110,7 @@ struct IntegrationTests {
   func secondGOP() throws {
     let clockRate: UInt32 = 90000
     var depacketizer = try H264Depacketizer(clockRate: clockRate, formatSpecificParams: nil)
-    var timeline = try Timeline(start: nil, clockRate: clockRate)
+    let timeline = try Timeline(start: nil, clockRate: clockRate)
     var parser = InorderParser(
       ssrc: nil, nextSeq: nil, isTcp: true, timeline: timeline)
 

@@ -56,7 +56,8 @@ struct G723Depacketizer: Sendable {
       timestamp: pkt.timestamp,
       frameLength: Self.fixedFrameLength,
       loss: pkt.loss,
-      data: payload
+      // Normalize to a standalone Data (startIndex 0) for the public frame.
+      data: Data(payload)
     )
   }
 

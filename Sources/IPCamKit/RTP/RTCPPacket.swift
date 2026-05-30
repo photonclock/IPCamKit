@@ -9,8 +9,6 @@ private let rtcpCommonHeaderLen = 4
 
 /// RTCP Sender Report payload type.
 let rtcpPayloadTypeSR: UInt8 = 200
-/// RTCP Receiver Report payload type.
-let rtcpPayloadTypeRR: UInt8 = 201
 
 /// A parsed RTCP packet reference.
 ///
@@ -90,29 +88,11 @@ struct RTCPPacketRef: Sendable {
     buf
   }
 
-  /// Parse as a typed packet (SR or RR) if payload type is recognized.
-  func asTyped() throws -> TypedPacketRef? {
-    switch payloadType {
-    case rtcpPayloadTypeSR:
-      return .senderReport(try SenderReportRef.validate(self))
-    case rtcpPayloadTypeRR:
-      return .receiverReport(try ReceiverReportRef.validate(self))
-    default:
-      return nil
-    }
-  }
-
   /// Parse as a sender report if the type matches.
   func asSenderReport() throws -> SenderReportRef? {
     guard payloadType == rtcpPayloadTypeSR else { return nil }
     return try SenderReportRef.validate(self)
   }
-}
-
-/// A payload type-specific RTCP packet accessor.
-enum TypedPacketRef: Sendable {
-  case senderReport(SenderReportRef)
-  case receiverReport(ReceiverReportRef)
 }
 
 /// A Sender Report (PT=200), RFC 3550 section 6.4.1.
@@ -163,34 +143,6 @@ struct SenderReportRef: Sendable {
   }
 }
 
-/// A Receiver Report (PT=201), RFC 3550 section 6.4.2.
-struct ReceiverReportRef: Sendable {
-  private static let headerLen = 8
-  private static let reportBlockLen = 24
-
-  let pkt: RTCPPacketRef
-
-  /// Validate that the packet length is consistent with the report block count.
-  static func validate(_ pkt: RTCPPacketRef) throws -> ReceiverReportRef {
-    let count = Int(pkt.count)
-    let expectedLen = headerLen + (count * reportBlockLen)
-    guard pkt.payloadEnd >= expectedLen else {
-      throw RTSPError.depacketizationError(
-        "RTCP RR has invalid count=\(count) with unpadded_byte_len=\(pkt.payloadEnd)")
-    }
-    return ReceiverReportRef(pkt: pkt)
-  }
-
-  /// SSRC of sender.
-  var ssrc: UInt32 {
-    let base = pkt.buf.startIndex + 4
-    return UInt32(pkt.buf[base]) << 24
-      | UInt32(pkt.buf[base + 1]) << 16
-      | UInt32(pkt.buf[base + 2]) << 8
-      | UInt32(pkt.buf[base + 3])
-  }
-}
-
 /// A validated RTCP compound packet.
 ///
 /// Validated per RFC 3550 Appendix A.2:
@@ -216,17 +168,5 @@ struct ReceivedCompoundPacket: Sendable {
       (pkt, rest) = try RTCPPacketRef.parse(rest)
     }
     return firstPkt
-  }
-
-  /// Iterate over all packets in this compound packet.
-  func packets() -> [RTCPPacketRef] {
-    var result: [RTCPPacketRef] = []
-    var remaining = raw
-    while !remaining.isEmpty {
-      guard let (pkt, rest) = try? RTCPPacketRef.parse(remaining) else { break }
-      result.append(pkt)
-      remaining = rest
-    }
-    return result
   }
 }

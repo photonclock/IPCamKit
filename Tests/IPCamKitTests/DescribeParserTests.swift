@@ -629,6 +629,40 @@ struct DescribeParserTests {
     #expect(p.streams.count == 1)
   }
 
+  @Test("SDP attribute names are matched case-insensitively")
+  func caseInsensitiveSDPAttributes() throws {
+    let sdp = [
+      "v=0",
+      "o=- 0 0 IN IP4 0.0.0.0",
+      "s=Stream",
+      "b=AS:512",
+      "m=video 0 RTP/AVP 96",
+      "a=RTPMAP:96 H264/90000",
+      "a=Control:trackID=7",
+    ].joined(separator: "\r\n")
+    let session = try SDPParser().parse(sdp)
+    // Session-level b= is retained (finding #43).
+    #expect(session.bandwidth == "AS:512")
+    let media = session.mediaDescriptions[0]
+    // Off-case a=Control/a=RTPMAP still resolve (findings #45/#48).
+    let stream = try parseMedia(baseURL: "rtsp://host/path", mediaDescription: media)
+    #expect(stream.encodingName == "h264")
+    #expect(stream.clockRateHz == 90000)
+    #expect(stream.control == "rtsp://host/path/trackID=7")
+  }
+
+  @Test("Tab-delimited m= line parses")
+  func tabDelimitedMediaLine() throws {
+    let sdp = "v=0\r\nm=video\t0\tRTP/AVP\t96\r\na=rtpmap:96 H264/90000\r\n"
+    let session = try SDPParser().parse(sdp)
+    let media = session.mediaDescriptions[0]
+    #expect(media.media == "video")
+    #expect(media.proto == "RTP/AVP")
+    let stream = try parseMedia(baseURL: "rtsp://h/p", mediaDescription: media)
+    #expect(stream.rtpPayloadType == 96)
+    #expect(stream.encodingName == "h264")
+  }
+
   // Test 19: rtp_info_trailing_semicolon
   // Uses gw_sub (single stream) to match upstream test
   @Test("RTP-Info trailing semicolon handled correctly")
@@ -685,6 +719,19 @@ struct DescribeParserTests {
     #expect(setup.ssrc == 0x2234_5685)
     #expect(setup.source == nil)
     #expect(setup.serverPort == 49152)
+  }
+
+  // Test 23: anjvision — scheme-less Content-Base header
+  // The Content-Base is "192.168.1.10:554/stream0/" with no "rtsp://" prefix;
+  // it must be resolved against the request URL's scheme. Port of retina 6972ac4.
+  @Test("Anjvision scheme-less Content-Base resolves against request scheme")
+  func anjvision() throws {
+    let url = "rtsp://192.168.1.10:554/stream0"
+    let p = try loadDescribe(url: url, filename: "anjvision_describe.txt")
+    #expect(p.tool == "LIVE555 Streaming Media v2011.05.25 CHAM.LI@ANJVISION.COM")
+    #expect(p.baseURL == "rtsp://192.168.1.10:554/stream0/")
+    #expect(p.streams.count == 1)
+    #expect(p.streams[0].control == "rtsp://192.168.1.10:554/stream0/trackID=1")
   }
 
   // MARK: - Video-less stream configurations (Axis `video=0`)
@@ -811,5 +858,70 @@ struct DescribeParserTests {
     #expect(usable.video == nil)
     #expect(usable.audio == nil)
     #expect(usable.metadata != nil)
+  }
+
+  @Test("parseDescribe surfaces a dropped unparseable stream via diagnostics")
+  func describeDropsUnparseableStreamWithDiagnostic() throws {
+    // One valid H.264 video stream plus an audio line with a dynamic payload
+    // type (99) and no rtpmap, which parseMedia can't resolve and drops.
+    let sdp = [
+      "v=0",
+      "o=- 0 0 IN IP4 0.0.0.0",
+      "s=S",
+      "m=video 0 RTP/AVP 96",
+      "a=rtpmap:96 H264/90000",
+      "m=audio 0 RTP/AVP 99",
+    ].joined(separator: "\r\n")
+    let resp = RTSPResponse(
+      statusCode: 200, reasonPhrase: "OK",
+      headers: [("Content-Type", "application/sdp")],
+      body: Data(sdp.utf8))
+
+    final class Box: @unchecked Sendable {
+      let lock = NSLock()
+      var messages: [String] = []
+      func add(_ d: RTSPDiagnostic) {
+        lock.lock()
+        defer { lock.unlock() }
+        messages.append(d.message)
+      }
+    }
+    let box = Box()
+    let p = try parseDescribe(
+      requestURL: "rtsp://h/p", response: resp, onDiagnostic: { box.add($0) })
+    // The good video stream is kept; the unparseable audio stream is dropped...
+    #expect(p.streams.count == 1)
+    #expect(p.streams.first?.media == "video")
+    // ...and surfaced rather than lost silently.
+    #expect(box.messages.contains { $0.lowercased().contains("audio") })
+  }
+
+  @Test("SETUP tolerates Session timeout=0 (finding #46)")
+  func setupTimeoutZero() throws {
+    let resp = RTSPResponse(
+      statusCode: 200, reasonPhrase: "OK",
+      headers: [
+        ("Session", "12345;timeout=0"),
+        ("Transport", "RTP/AVP/TCP;unicast;interleaved=0-1"),
+      ])
+    let setup = try parseSetup(response: resp)
+    #expect(setup.session.timeoutSec == 60)  // default cadence, not aborted
+    #expect(setup.channelId == 0)
+  }
+
+  @Test("SETUP accepts single-value interleaved, rejects non-consecutive (finding #47)")
+  func setupInterleavedSingleValue() throws {
+    func setup(_ interleaved: String) throws -> SetupResponse {
+      try parseSetup(
+        response: RTSPResponse(
+          statusCode: 200, reasonPhrase: "OK",
+          headers: [
+            ("Session", "12345;timeout=60"),
+            ("Transport", "RTP/AVP/TCP;unicast;interleaved=\(interleaved)"),
+          ]))
+    }
+    #expect(try setup("0").channelId == 0)
+    #expect(try setup("2-3").channelId == 2)
+    #expect(throws: RTSPError.self) { _ = try setup("0-5") }
   }
 }

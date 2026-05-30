@@ -21,20 +21,26 @@ public struct SDPSession: Sendable {
   /// t= (timing)
   public var timing: String?
 
+  /// b= (bandwidth, session-level)
+  public var bandwidth: String?
+
   /// Session-level attributes
   public var attributes: [SDPAttribute] = []
 
   /// Media descriptions
   public var mediaDescriptions: [SDPMediaDescription] = []
 
-  /// Look up a session-level attribute by name. Returns the first match.
+  /// Look up a session-level attribute by name (case-insensitive). Returns the
+  /// first match.
   public func attribute(_ name: String) -> SDPAttribute? {
-    attributes.first { $0.name == name }
+    let key = name.lowercased()
+    return attributes.first { $0.name == key }
   }
 
-  /// Look up all session-level attributes with the given name.
+  /// Look up all session-level attributes with the given name (case-insensitive).
   public func attributes(named name: String) -> [SDPAttribute] {
-    attributes.filter { $0.name == name }
+    let key = name.lowercased()
+    return attributes.filter { $0.name == key }
   }
 }
 
@@ -61,14 +67,17 @@ public struct SDPMediaDescription: Sendable {
   /// Media-level attributes
   public var attributes: [SDPAttribute] = []
 
-  /// Look up a media-level attribute by name. Returns the first match.
+  /// Look up a media-level attribute by name (case-insensitive). Returns the
+  /// first match.
   public func attribute(_ name: String) -> SDPAttribute? {
-    attributes.first { $0.name == name }
+    let key = name.lowercased()
+    return attributes.first { $0.name == key }
   }
 
-  /// Look up all media-level attributes with the given name.
+  /// Look up all media-level attributes with the given name (case-insensitive).
   public func attributes(named name: String) -> [SDPAttribute] {
-    attributes.filter { $0.name == name }
+    let key = name.lowercased()
+    return attributes.filter { $0.name == key }
   }
 }
 

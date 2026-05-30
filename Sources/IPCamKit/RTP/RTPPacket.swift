@@ -85,7 +85,10 @@ struct RawRTPPacket: Sendable, Equatable {
       payloadEnd = len
     }
 
-    let range = Int(payloadStart)..<Int(payloadEnd)
+    // payloadStart/payloadEnd are offsets from the packet start; translate them
+    // to absolute indices so `data[payloadRange]` is correct even when `data`
+    // is a slice with a nonzero startIndex (every header accessor does the same).
+    let range = (data.startIndex + Int(payloadStart))..<(data.startIndex + Int(payloadEnd))
     return .success(RawRTPPacket(data: data, payloadRange: range))
   }
 

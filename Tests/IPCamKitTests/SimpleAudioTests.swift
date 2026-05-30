@@ -37,4 +37,13 @@ struct SimpleAudioTests {
     let d = SimpleAudioDepacketizer(clockRate: 16000, bitsPerSample: 16)
     #expect(d.frameLength(payloadLen: 321) == nil)
   }
+
+  /// An oversized payload length must return nil rather than trap the process
+  /// (was a precondition on attacker-controlled length — finding #19).
+  @Test("Oversized payload length returns nil instead of trapping")
+  func frameLengthOversized() {
+    let d = SimpleAudioDepacketizer(clockRate: 8000, bitsPerSample: 8)
+    #expect(d.frameLength(payloadLen: Int(UInt16.max)) == nil)
+    #expect(d.frameLength(payloadLen: 70_000) == nil)
+  }
 }

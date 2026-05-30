@@ -7,9 +7,11 @@ import Network
 
 /// Transport mode for RTP data.
 public enum Transport: Sendable {
-  /// RTP interleaved over RTSP TCP connection.
+  /// RTP interleaved over the RTSP TCP connection.
   case tcp
-  /// RTP/RTCP on separate UDP ports.
+  /// RTP and RTCP on a separate UDP socket pair — an even local RTP port and the
+  /// consecutive odd RTCP port — negotiated via `client_port` in SETUP. Works
+  /// over both IPv4 and IPv6 peers.
   case udp
 }
 
@@ -97,11 +99,15 @@ public struct SessionDescription: Sendable {
 /// ```swift
 /// let session = RTSPClientSession(url: "rtsp://host:554/stream")
 /// let desc = try await session.start()
-/// for try await frame in session.videoFrames() {
-///     // Process frame.nalus
+/// for try await item in session.frames() {
+///     switch item {
+///     case .video(let frame): _ = frame.nalus  // AVCC NAL units
+///     case .audio, .metadata, .rtcp: break
+///     }
 /// }
 /// await session.stop()
 /// ```
+/// `frames()` may be consumed only once per session.
 public final class RTSPClientSession: Sendable {
   private let url: String
   private let credentials: Credentials?
@@ -109,19 +115,38 @@ public final class RTSPClientSession: Sendable {
   private let userAgent: String
   private let onDiagnostic: (@Sendable (RTSPDiagnostic) -> Void)?
   private let state: SessionState
+  /// Test-only override of the keepalive interval. When nil (production), the
+  /// interval is derived from the server's advertised session timeout.
+  private let keepaliveInterval: Duration?
 
-  public init(
+  public convenience init(
     url: String,
     credentials: Credentials? = nil,
     transport: Transport = .tcp,
     userAgent: String = "IPCamKit",
     onDiagnostic: (@Sendable (RTSPDiagnostic) -> Void)? = nil
   ) {
+    self.init(
+      url: url, credentials: credentials, transport: transport,
+      userAgent: userAgent, onDiagnostic: onDiagnostic, keepaliveInterval: nil)
+  }
+
+  /// Designated initializer. `keepaliveInterval` is internal and intended for
+  /// tests that need a short, deterministic keepalive cadence.
+  init(
+    url: String,
+    credentials: Credentials?,
+    transport: Transport,
+    userAgent: String,
+    onDiagnostic: (@Sendable (RTSPDiagnostic) -> Void)?,
+    keepaliveInterval: Duration?
+  ) {
     self.url = url
     self.credentials = credentials
     self.transport = transport
     self.userAgent = userAgent
     self.onDiagnostic = onDiagnostic
+    self.keepaliveInterval = keepaliveInterval
     self.state = SessionState()
   }
 
@@ -134,7 +159,8 @@ public final class RTSPClientSession: Sendable {
       credentials: credentials,
       transport: transport,
       userAgent: userAgent,
-      onDiagnostic: onDiagnostic
+      onDiagnostic: onDiagnostic,
+      keepaliveInterval: keepaliveInterval
     )
   }
 
@@ -189,7 +215,10 @@ public struct PublicAudioFrame: Sendable {
   /// Channel count, if known.
   public let channels: UInt16?
 
-  /// Number of RTP packets lost before this frame.
+  /// RTP packets lost before this frame: the forward gap in the RTP sequence
+  /// number. May be large (or spurious) if a camera's packetizer emits a wildly
+  /// forward-jumped sequence number, so treat it as a discontinuity indicator
+  /// rather than an exact loss count.
   public let loss: UInt16
 }
 
@@ -206,7 +235,10 @@ public struct PublicMetadataFrame: Sendable {
   /// SDP encoding name (e.g. `vnd.onvif.metadata`).
   public let encodingName: String
 
-  /// Number of RTP packets lost before this frame.
+  /// RTP packets lost before this frame: the forward gap in the RTP sequence
+  /// number. May be large (or spurious) if a camera's packetizer emits a wildly
+  /// forward-jumped sequence number, so treat it as a discontinuity indicator
+  /// rather than an exact loss count.
   public let loss: UInt16
 }
 
@@ -221,7 +253,10 @@ public struct PublicVideoFrame: Sendable {
   /// Whether this is a keyframe (IDR).
   public let isKeyframe: Bool
 
-  /// Number of RTP packets lost before this frame.
+  /// RTP packets lost before this frame: the forward gap in the RTP sequence
+  /// number. May be large (or spurious) if a camera's packetizer emits a wildly
+  /// forward-jumped sequence number, so treat it as a discontinuity indicator
+  /// rather than an exact loss count.
   public let loss: UInt16
 
   /// SPS data if parameters changed with this frame.
@@ -273,6 +308,16 @@ enum VideoDepacketizer: Sendable {
 
 // MARK: - Internal Session State
 
+/// One demultiplexed data-plane datagram in a UDP session: an RTP or RTCP packet
+/// tagged with its stream index. The per-socket readers fan these into a single
+/// ordered consumer on the session actor. Control-plane traffic (keepalive /
+/// TEARDOWN responses, connection close) is handled directly by the control
+/// reader, off this lossy buffer, so it is never dropped under RTP backpressure.
+private enum UDPTransportEvent: Sendable {
+  case rtp(streamIndex: Int, data: Data)
+  case rtcp(streamIndex: Int, data: Data)
+}
+
 /// Actor-based internal state for thread-safe session management.
 actor SessionState {
   private var connection: RTSPTransportConnection?
@@ -292,26 +337,72 @@ actor SessionState {
   private var audioChannels: UInt16?
   private var applicationEncodingName: String?
   private var channelMappings = ChannelMappings()
+  /// UDP socket pairs keyed by stream index (UDP transport only); empty for TCP.
+  private var udpPairs: [Int: UDPPair] = [:]
   private var inorderParsers: [Int: InorderParser] = [:]
   private var userAgent: String?
+  /// Selected RTP transport; drives SETUP, the receive loop, and parser config.
+  private var transport: Transport = .tcp
+  /// RTSP server host from the URL; the UDP RTP/RTCP peer fallback when SETUP
+  /// omits an explicit `source`.
+  private var host: String?
   private var isPlaying = false
+  /// True while a `frames()` reader loop owns the connection. A second
+  /// concurrent reader would race the same socket and corrupt the RTP pipeline,
+  /// so it is rejected.
+  private var isStreaming = false
   private var onDiagnostic: (@Sendable (RTSPDiagnostic) -> Void)?
+  /// Session timeout advertised by the server in the SETUP `Session` header,
+  /// in seconds. Drives the keepalive interval while streaming.
+  private var sessionTimeoutSec: UInt32 = 60
+  /// Whether the server advertised `GET_PARAMETER` in its OPTIONS `Public`
+  /// header. When true it is preferred over `OPTIONS` as the keepalive method.
+  private var getParameterSupported = false
+  /// Control responses awaited by `sendControlRequest`, keyed by CSeq. The
+  /// `streamFrames` reader resumes them as matching responses arrive.
+  private var pendingResponses: [UInt32: CheckedContinuation<RTSPResponse, Error>] = [:]
+  /// Per-CSeq timeout tasks, cancelled as soon as the waiter resolves so a fast
+  /// response doesn't leave a sleeping task lingering for the full timeout.
+  private var pendingTimeouts: [UInt32: Task<Void, Never>] = [:]
+  /// The periodic keepalive task, active only while streaming.
+  private var keepaliveTask: Task<Void, Never>?
+  /// Why the UDP control connection closed, recorded by the control reader so
+  /// the consumer loop can distinguish a clean stop() from a peer drop after the
+  /// event stream finishes. nil while the connection is healthy.
+  private var udpControlError: RTSPError?
+  /// Test-only override of the keepalive interval; nil derives it from the
+  /// server's advertised session timeout.
+  private var keepaliveIntervalOverride: Duration?
+  /// Bound on the UDP multiplexing buffer. RTP, RTCP, and control events queue
+  /// here between the socket readers and the actor-isolated consumer; under
+  /// normal operation the consumer keeps up and it never fills. If a stalled
+  /// consumer ever overruns it, the oldest datagrams are dropped (surfacing as
+  /// RTP loss) rather than the buffer growing without bound.
+  private static let udpEventBufferCount = 4096
 
   func start(
     url: String,
     credentials: Credentials?,
     transport: Transport,
     userAgent: String,
-    onDiagnostic: (@Sendable (RTSPDiagnostic) -> Void)?
+    onDiagnostic: (@Sendable (RTSPDiagnostic) -> Void)?,
+    keepaliveInterval: Duration? = nil
   ) async throws -> SessionDescription {
     self.onDiagnostic = onDiagnostic
+    self.keepaliveIntervalOverride = keepaliveInterval
+    self.transport = transport
+
     // Parse URL
     guard let urlComponents = URLComponents(string: url) else {
       throw RTSPError.connectionFailed("Invalid URL: \(url)")
     }
-    let host = urlComponents.host ?? "localhost"
-    let port = UInt16(urlComponents.port ?? 554)
+    let host = unbracketedHost(urlComponents.host ?? "localhost")
+    let rawPort = urlComponents.port ?? 554
+    guard let port = UInt16(exactly: rawPort) else {
+      throw RTSPError.connectionFailed("Invalid port \(rawPort) in URL: \(url)")
+    }
 
+    self.host = host
     self.userAgent = userAgent
 
     // Set up authenticator
@@ -324,13 +415,21 @@ actor SessionState {
     try await conn.connect(host: host, port: port)
     connection = conn
 
+    // OPTIONS (best-effort): discover whether the server supports
+    // GET_PARAMETER, which is the preferred keepalive method. A server that
+    // rejects or omits OPTIONS just leaves us defaulting to OPTIONS keepalive.
+    if let optionsResp = try? await sendRequest(method: .options, url: url) {
+      getParameterSupported = parseOptions(response: optionsResp).getParameterSupported
+    }
+
     // DESCRIBE
     let describeResp = try await sendRequest(
       method: .describe,
       url: url,
       extraHeaders: [("Accept", "application/sdp")]
     )
-    var presMut = try parseDescribe(requestURL: url, response: describeResp)
+    var presMut = try parseDescribe(
+      requestURL: url, response: describeResp, onDiagnostic: onDiagnostic)
     presentation = presMut
 
     self.url = url
@@ -346,24 +445,8 @@ actor SessionState {
 
     if let videoIdx = videoIdx {
       let stream = presMut.streams[videoIdx]
-      let setupURL = stream.control ?? url
-      var setupHeaders: [(String, String)] = []
-      if transport == .tcp {
-        let channelId = channelMappings.nextUnassigned() ?? 0
-        setupHeaders.append(
-          (
-            "Transport",
-            "RTP/AVP/TCP;unicast;interleaved=\(channelId)-\(channelId + 1)"
-          ))
-        try channelMappings.assign(channelId: channelId, streamIndex: videoIdx)
-      } else {
-        setupHeaders.append(("Transport", "RTP/AVP;unicast"))
-      }
-
-      let setupResp = try await sendRequest(
-        method: .setup, url: setupURL, extraHeaders: setupHeaders)
-      let setup = try parseSetup(response: setupResp)
-      sessionId = setup.session.id
+      let setup = try await setupStream(
+        controlURL: stream.control ?? url, streamIndex: videoIdx)
       videoSetupSSRC = setup.ssrc
       presMut.streams[videoIdx].state = .setup(
         StreamStateInit(ssrc: setup.ssrc, initialSeq: nil, initialRtptime: nil, ctx: .dummy))
@@ -378,36 +461,8 @@ actor SessionState {
 
     if let audioIdx = audioIdx {
       let audioStream = presMut.streams[audioIdx]
-      let audioSetupURL = audioStream.control ?? url
-      var audioSetupHeaders: [(String, String)] = []
-      if transport == .tcp {
-        let audioChannelId = channelMappings.nextUnassigned() ?? 2
-        audioSetupHeaders.append(
-          (
-            "Transport",
-            "RTP/AVP/TCP;unicast;interleaved=\(audioChannelId)-\(audioChannelId + 1)"
-          ))
-        try channelMappings.assign(
-          channelId: audioChannelId, streamIndex: audioIdx)
-      } else {
-        audioSetupHeaders.append(("Transport", "RTP/AVP;unicast"))
-      }
-      if let sid = sessionId {
-        audioSetupHeaders.append(("Session", sid))
-      }
-      let audioSetupResp = try await sendRequest(
-        method: .setup, url: audioSetupURL,
-        extraHeaders: audioSetupHeaders)
-      let audioSetup = try parseSetup(response: audioSetupResp)
-      if let prev = sessionId, prev != audioSetup.session.id {
-        onDiagnostic?(
-          RTSPDiagnostic(
-            severity: .warning,
-            message:
-              "Camera issued a new Session ID at audio SETUP "
-              + "(\(prev) -> \(audioSetup.session.id)); rolling forward."))
-      }
-      sessionId = audioSetup.session.id
+      let audioSetup = try await setupStream(
+        controlURL: audioStream.control ?? url, streamIndex: audioIdx)
       audioSetupSSRC = audioSetup.ssrc
       presMut.streams[audioIdx].state = .setup(
         StreamStateInit(ssrc: audioSetup.ssrc, initialSeq: nil, initialRtptime: nil, ctx: .dummy))
@@ -429,38 +484,9 @@ actor SessionState {
 
     if let idx = applicationIdx {
       let applicationStream = presMut.streams[idx]
-      let applicationSetupURL = applicationStream.control ?? url
-      var applicationSetupHeaders: [(String, String)] = []
-      if transport == .tcp {
-        let applicationChannelId = channelMappings.nextUnassigned() ?? 4
-        applicationSetupHeaders.append(
-          (
-            "Transport",
-            "RTP/AVP/TCP;unicast;interleaved=\(applicationChannelId)-\(applicationChannelId + 1)"
-          ))
-        try channelMappings.assign(
-          channelId: applicationChannelId, streamIndex: idx)
-      } else {
-        applicationSetupHeaders.append(("Transport", "RTP/AVP;unicast"))
-      }
-      if let sid = sessionId {
-        applicationSetupHeaders.append(("Session", sid))
-      }
-
       do {
-        let applicationSetupResp = try await sendRequest(
-          method: .setup, url: applicationSetupURL,
-          extraHeaders: applicationSetupHeaders)
-        let applicationSetup = try parseSetup(response: applicationSetupResp)
-        if let prev = sessionId, prev != applicationSetup.session.id {
-          onDiagnostic?(
-            RTSPDiagnostic(
-              severity: .warning,
-              message:
-                "Camera issued a new Session ID at application SETUP "
-                + "(\(prev) -> \(applicationSetup.session.id)); rolling forward."))
-        }
-        sessionId = applicationSetup.session.id
+        let applicationSetup = try await setupStream(
+          controlURL: applicationStream.control ?? url, streamIndex: idx)
         applicationSetupSSRC = applicationSetup.ssrc
         presMut.streams[idx].state = .setup(
           StreamStateInit(
@@ -507,6 +533,26 @@ actor SessionState {
     try parsePlay(response: playResp, presentation: &presMut)
     presentation = presMut
 
+    // Surface (once) any interleaved media the camera streamed on the control
+    // channel before its PLAY response completed — those frames were dropped.
+    let droppedPrePlay = await conn.droppedInterleavedBeforeResponse
+    if droppedPrePlay > 0 {
+      onDiagnostic?(
+        RTSPDiagnostic(
+          severity: .warning,
+          message: "Dropped \(droppedPrePlay) interleaved frame(s) on the control channel "
+            + "before the PLAY response completed; camera streamed before PLAY."))
+    }
+
+    // UDP NAT/firewall hole-punch: now that the server is sending (post-PLAY),
+    // poke each local RTP/RTCP port toward its peer so inbound datagrams can
+    // traverse a NAT. Best-effort and a no-op on loopback/LAN.
+    if transport == .udp {
+      for pair in udpPairs.values {
+        pair.holePunch()
+      }
+    }
+
     // Initialize video depacketizer + timeline + inorder parser. Conditional
     // on a successful video SETUP — when no video stream was set up,
     // `videoStreamIndex` is nil and we skip the entire video pipeline.
@@ -524,6 +570,19 @@ actor SessionState {
             clockRate: stream.clockRateHz,
             formatSpecificParams: stream.formatSpecificParams))
       }
+      // If the SDP advertised parameter sets (sprop-*) but the depacketizer
+      // couldn't parse them, it silently falls back to in-band parameters;
+      // surface that, since the first decodable frame may be delayed.
+      if let fmtp = stream.formatSpecificParams,
+        fmtp.lowercased().contains("sprop"),
+        depacketizer?.videoParameters == nil
+      {
+        onDiagnostic?(
+          RTSPDiagnostic(
+            severity: .warning,
+            message: "Video fmtp advertised sprop parameter sets but they could not be "
+              + "parsed; falling back to in-band parameters."))
+      }
       videoClockRate = stream.clockRateHz
 
       var videoStart: UInt32?
@@ -532,7 +591,10 @@ actor SessionState {
 
       if case .setup(let init_) = presMut.streams[videoIdx].state {
         videoStart = init_.initialRtptime
-        if let seq = init_.initialSeq, seq != 0, seq != 1 {
+        // Adopt the RTP-Info initial sequence so loss before the first received
+        // packet is detected. Only ignore the `seq=0;rtptime=0` placeholder some
+        // cameras emit instead of a real seed (finding #50).
+        if let seq = init_.initialSeq, !(seq == 0 && (init_.initialRtptime ?? 0) == 0) {
           videoSeq = seq
         }
         if let s = init_.ssrc { videoSsrc = s }
@@ -565,22 +627,39 @@ actor SessionState {
 
         if case .setup(let init_) = presMut.streams[audioIdx].state {
           audioStart = init_.initialRtptime
-          if let seq = init_.initialSeq, seq != 0, seq != 1 {
+          // See the video seed above (finding #50): only the placeholder is ignored.
+          if let seq = init_.initialSeq, !(seq == 0 && (init_.initialRtptime ?? 0) == 0) {
             audioSeq = seq
           }
           if let s = init_.ssrc { resolvedAudioSsrc = s }
         }
 
-        let audioTimeline = try Timeline(
-          start: audioStart, clockRate: audioStream.clockRateHz)
-        inorderParsers[audioIdx] = InorderParser(
-          ssrc: resolvedAudioSsrc, nextSeq: audioSeq,
-          isTcp: transport == .tcp, timeline: audioTimeline,
-          onDiagnostic: onDiagnostic)
-        resolvedAudioCodec = publicAudioCodec(
-          from: audioStream.encodingName)
-        resolvedAudioRate = audioStream.clockRateHz
-        resolvedAudioChannels = audioStream.channels
+        do {
+          let audioTimeline = try Timeline(
+            start: audioStart, clockRate: audioStream.clockRateHz)
+          inorderParsers[audioIdx] = InorderParser(
+            ssrc: resolvedAudioSsrc, nextSeq: audioSeq,
+            isTcp: transport == .tcp, timeline: audioTimeline,
+            onDiagnostic: onDiagnostic)
+          resolvedAudioCodec = publicAudioCodec(
+            from: audioStream.encodingName)
+          resolvedAudioRate = audioStream.clockRateHz
+          resolvedAudioChannels = audioStream.channels
+        } catch {
+          // Audio is best-effort: a broken clock rate must not abort the
+          // whole session. Disable audio and carry on (mirrors metadata).
+          onDiagnostic?(
+            RTSPDiagnostic(
+              severity: .warning,
+              message:
+                "Failed to initialize audio timeline: \(error); "
+                + "audio will not be delivered."))
+          audioDepacketizer = nil
+          audioStreamIndex = nil
+          audioEncodingName = nil
+          audioClockRate = nil
+          audioChannels = nil
+        }
       } else {
         // Audio SETUP succeeded but the depacketizer rejected the format
         // (e.g. malformed AAC fmtp). Null the audio state so packets on
@@ -612,7 +691,8 @@ actor SessionState {
 
       if case .setup(let init_) = presMut.streams[applicationIdx].state {
         applicationStart = init_.initialRtptime
-        if let seq = init_.initialSeq, seq != 0, seq != 1 {
+        // See the video seed above (finding #50): only the placeholder is ignored.
+        if let seq = init_.initialSeq, !(seq == 0 && (init_.initialRtptime ?? 0) == 0) {
           applicationSeq = seq
         }
         if let s = init_.ssrc { resolvedApplicationSsrc = s }
@@ -714,127 +794,470 @@ actor SessionState {
       return
     }
 
-    while isPlaying {
-      let msg = try await conn.receiveMessage()
+    // frames() may be consumed by only one reader at a time; a second concurrent
+    // reader would race the same connection. The check-and-set is atomic (no
+    // await between them on this actor).
+    guard !isStreaming else {
+      continuation.finish(
+        throwing: RTSPError.invalidState("frames() is already being consumed"))
+      return
+    }
+    isStreaming = true
+    defer { isStreaming = false }
 
-      guard case .data(let interleaved) = msg else { continue }
-      guard let mapping = channelMappings.lookup(interleaved.channelId) else { continue }
+    startKeepalive()
+    defer {
+      keepaliveTask?.cancel()
+      keepaliveTask = nil
+    }
 
-      if mapping.channelType == .rtp {
-        guard var parser = inorderParsers[mapping.streamIndex] else { continue }
-
-        if let videoIdx = videoStreamIndex, mapping.streamIndex == videoIdx {
-          guard var depkt = depacketizer else { continue }
-          if let pkt = try parser.rtp(
-            data: interleaved.data, ctx: .dummy,
-            streamId: mapping.streamIndex, streamCtx: .dummy)
-          {
-            if pkt.payload.isEmpty {
-              onDiagnostic?(
-                RTSPDiagnostic(
-                  severity: .warning,
-                  message: "Empty video RTP payload from camera; packet skipped."))
-            }
-            do {
-              try depkt.push(pkt)
-            } catch {
-              throw RTSPError.depacketizationError("Video push failed: \(error)")
-            }
-            while let result = depkt.pull() {
-              switch result {
-              case .success(.videoFrame(let frame)):
-                let publicFrame = convertFrame(frame, depacketizer: depkt)
-                continuation.yield(.video(publicFrame))
-              case .failure(let err):
-                throw RTSPError.depacketizationError("Video depacketization failed: \(err)")
-              default:
-                break
-              }
-            }
-          }
-          depacketizer = depkt
-        } else if let audioIdx = audioStreamIndex, mapping.streamIndex == audioIdx {
-          guard var depkt = audioDepacketizer else { continue }
-          if let pkt = try parser.rtp(
-            data: interleaved.data, ctx: .dummy,
-            streamId: mapping.streamIndex, streamCtx: .dummy)
-          {
-            try depkt.push(pkt)
-            while let result = depkt.pull() {
-              switch result {
-              case .success(.audioFrame(let frame)):
-                let publicFrame = PublicAudioFrame(
-                  data: frame.data,
-                  timestamp: frame.timestamp.elapsedSeconds,
-                  codec: publicAudioCodec(
-                    from: audioEncodingName ?? ""),
-                  sampleRate: audioClockRate ?? 0,
-                  channels: audioChannels,
-                  loss: frame.loss
-                )
-                continuation.yield(.audio(publicFrame))
-              case .failure(let err):
-                throw RTSPError.depacketizationError("Audio depacketization failed: \(err)")
-              default:
-                break
-              }
-            }
-          }
-          audioDepacketizer = depkt
-        } else if let applicationIdx = applicationStreamIndex,
-          mapping.streamIndex == applicationIdx
-        {
-          guard var depkt = applicationDepacketizer else { continue }
-          if let pkt = try parser.rtp(
-            data: interleaved.data, ctx: .dummy,
-            streamId: mapping.streamIndex, streamCtx: .dummy)
-          {
-            try depkt.push(pkt)
-            while let result = depkt.pull() {
-              switch result {
-              case .success(.metadataFrame(let frame)):
-                let publicFrame = PublicMetadataFrame(
-                  data: frame.data,
-                  timestamp: frame.timestamp.elapsedSeconds,
-                  encodingName: applicationEncodingName ?? "",
-                  loss: frame.loss
-                )
-                continuation.yield(.metadata(publicFrame))
-              case .failure(let err):
-                throw RTSPError.depacketizationError("Metadata depacketization failed: \(err)")
-              default:
-                break
-              }
-            }
-          }
-          applicationDepacketizer = depkt
-        }
-
-        inorderParsers[mapping.streamIndex] = parser
-      } else if mapping.channelType == .rtcp {
-        guard var parser = inorderParsers[mapping.streamIndex] else { continue }
-        if let rtcpPkt = try parser.rtcp(
-          ctx: .dummy, streamId: mapping.streamIndex, data: interleaved.data)
-        {
-          continuation.yield(
-            .rtcp(
-              PublicRTCPPacket(timestamp: rtcpPkt.rtpTimestamp?.elapsedSeconds, data: rtcpPkt.raw)))
-        }
-        inorderParsers[mapping.streamIndex] = parser
-      }
+    switch transport {
+    case .tcp:
+      try await streamFramesTCP(conn: conn, continuation: continuation)
+    case .udp:
+      try await streamFramesUDP(conn: conn, continuation: continuation)
     }
 
     continuation.finish()
   }
 
-  func stop() async {
-    isPlaying = false
-    if let _ = connection, let sid = sessionId, let url = self.url {
-      // Send TEARDOWN (best-effort) using sendRequest to include Auth and other headers
-      _ = try? await sendRequest(method: .teardown, url: url, extraHeaders: [("Session", sid)])
+  /// TCP-interleaved reader loop. Owns the single TCP connection: it
+  /// demultiplexes interleaved RTP/RTCP and routes RTSP responses (keepalive /
+  /// TEARDOWN) back to their waiters. Runs until the socket closes — by stop()
+  /// (clean) or by the peer (propagates the error).
+  private func streamFramesTCP(
+    conn: RTSPTransportConnection,
+    continuation: AsyncThrowingStream<PublicCodecItem, Error>.Continuation
+  ) async throws {
+    while true {
+      let msg: RTSPMessage
+      do {
+        msg = try await conn.receiveMessage()
+      } catch {
+        // After stop() set isPlaying = false, the socket close is expected —
+        // end cleanly. Otherwise the peer dropped us; propagate the error.
+        if !isPlaying { break }
+        throw error
+      }
+
+      // Route control responses (keepalive / TEARDOWN) to their awaiting sender.
+      if case .response(let resp) = msg {
+        if let cseq = resp.cseq { resumePending(cseq, .success(resp)) }
+        continue
+      }
+
+      guard case .data(let interleaved) = msg else { continue }
+      guard let mapping = channelMappings.lookup(interleaved.channelId) else {
+        // The camera sent interleaved data on a channel we never negotiated.
+        // Drop it (can't route it) but surface it once per channel.
+        warnStreamOnce(
+          "channel.\(interleaved.channelId)", .warning,
+          "Interleaved data on unassigned channel \(interleaved.channelId); dropped.")
+        continue
+      }
+
+      if mapping.channelType == .rtp {
+        try routeRTP(
+          streamIndex: mapping.streamIndex, data: interleaved.data, continuation: continuation)
+      } else if mapping.channelType == .rtcp {
+        try routeRTCP(
+          streamIndex: mapping.streamIndex, data: interleaved.data, continuation: continuation)
+      }
     }
+  }
+
+  /// UDP reader loop. RTP and RTCP arrive on per-stream UDP sockets while RTSP
+  /// control (keepalive / TEARDOWN responses) stays on the TCP connection, so
+  /// the three sources are multiplexed through one ordered event stream and fed
+  /// to the same routing pipeline as TCP. Runs until the TCP control connection
+  /// closes — by stop() (clean) or by the peer (propagates the error).
+  private func streamFramesUDP(
+    conn: RTSPTransportConnection,
+    continuation: AsyncThrowingStream<PublicCodecItem, Error>.Continuation
+  ) async throws {
+    udpControlError = nil
+    let (events, eventCont) = AsyncStream.makeStream(
+      of: UDPTransportEvent.self,
+      bufferingPolicy: .bufferingNewest(Self.udpEventBufferCount))
+
+    // Per-stream UDP receivers feed RTP/RTCP datagrams into the event stream.
+    // Each socket's DispatchSource is serial, so per-stream packet order holds.
+    let diag = onDiagnostic
+    for (idx, pair) in udpPairs {
+      pair.startReceiving(
+        onRTP: { eventCont.yield(.rtp(streamIndex: idx, data: $0)) },
+        onRTCP: { eventCont.yield(.rtcp(streamIndex: idx, data: $0)) },
+        onError: { error in
+          // Surface the terminal receive error so a NAT'd camera whose UDP flow
+          // dies isn't a silent stall. (Control stays on TCP; keepalive/TEARDOWN
+          // still work.)
+          diag?(
+            RTSPDiagnostic(
+              severity: .warning,
+              message: "UDP receive on stream \(idx) stopped: \(error)"))
+        })
+    }
+
+    // The TCP connection now carries only control responses (no interleaved
+    // data). The control reader handles keepalive/TEARDOWN responses directly
+    // (off the lossy data buffer) and, on close, records why and ends the event
+    // stream so the consumer unblocks even if no more datagrams arrive.
+    let controlReader = Task { [weak self] in
+      while true {
+        let msg: RTSPMessage
+        do {
+          msg = try await conn.receiveMessage()
+        } catch {
+          let rtspError = (error as? RTSPError) ?? .connectionFailed("\(error)")
+          await self?.recordUDPControlClose(rtspError)
+          eventCont.finish()
+          return
+        }
+        if case .response(let resp) = msg, let cseq = resp.cseq {
+          await self?.resumePending(cseq, .success(resp))
+        }
+        // Interleaved data isn't expected on a UDP session; ignore it.
+      }
+    }
+
+    // The consumer owns teardown: stop the control reader and release the UDP
+    // sockets (stop() also closes the pairs — close() is idempotent). The reader
+    // task may linger blocked on receiveMessage until stop() closes the TCP
+    // connection; that is the documented contract for releasing the session.
+    defer {
+      controlReader.cancel()
+      eventCont.finish()
+      for pair in udpPairs.values { pair.close() }
+    }
+
+    for await event in events {
+      switch event {
+      case .rtp(let idx, let data):
+        try routeRTP(streamIndex: idx, data: data, continuation: continuation)
+      case .rtcp(let idx, let data):
+        try routeRTCP(streamIndex: idx, data: data, continuation: continuation)
+      }
+    }
+
+    // The stream finished, which only happens when the control connection
+    // closed. A clean stop() (isPlaying == false) ends here; a peer drop while
+    // still playing propagates the recorded transport error.
+    if isPlaying, let error = udpControlError {
+      throw error
+    }
+  }
+
+  /// Record the error that closed the UDP session's TCP control connection.
+  /// Called by the control reader so the consumer can classify the close.
+  private func recordUDPControlClose(_ error: RTSPError) {
+    udpControlError = error
+  }
+
+  /// One-shot latch keys for per-stream conditions that can recur per packet or
+  /// per frame, so a sloppy/hostile camera can't flood `onDiagnostic`.
+  private var warnedStreamConditions: Set<String> = []
+
+  /// Emit `message` only the first time `key` is seen this session.
+  private func warnStreamOnce(
+    _ key: String, _ severity: RTSPDiagnostic.Severity, _ message: @autoclosure () -> String
+  ) {
+    guard warnedStreamConditions.insert(key).inserted else { return }
+    onDiagnostic?(RTSPDiagnostic(severity: severity, message: message()))
+  }
+
+  /// Surface (once each) the FU-reassembly anomalies the video depacketizer
+  /// tracks — an inconsistent FU NAL header or an RFC-forbidden single-fragment
+  /// FU — both tolerated but worth telling the consumer about.
+  private func surfaceVideoAnomalies(_ depkt: VideoDepacketizer) {
+    let inconsistentFu: Bool
+    let singleFragmentFu: Bool
+    switch depkt {
+    case .h264(let d):
+      inconsistentFu = d.seenInconsistentFuANalHdr
+      singleFragmentFu = d.seenSingleFragmentFuA
+    case .h265(let d):
+      inconsistentFu = d.seenInconsistentFuNalHdr
+      singleFragmentFu = d.seenSingleFragmentFu
+    }
+    if inconsistentFu {
+      warnStreamOnce(
+        "video.fuHeaderInconsistent", .warning,
+        "Camera sent FU fragments with an inconsistent NAL header; tolerated.")
+    }
+    if singleFragmentFu {
+      warnStreamOnce(
+        "video.singleFragmentFu", .info,
+        "Camera sent a single-fragment FU (RFC-forbidden); treated as a complete NAL.")
+    }
+  }
+
+  /// Route one RTP packet to its stream's depacketizer, yielding any completed
+  /// frames. Shared by the TCP and UDP reader loops; a missing parser or
+  /// depacketizer (a disabled stream) drops the packet. A malformed wire packet
+  /// or a per-frame depacketization failure drops that packet/frame and emits a
+  /// rate-limited diagnostic rather than tearing down the whole stream — only
+  /// the opt-in `.abortSession` SSRC policy still propagates fatally.
+  private func routeRTP(
+    streamIndex: Int, data: Data,
+    continuation: AsyncThrowingStream<PublicCodecItem, Error>.Continuation
+  ) throws {
+    guard var parser = inorderParsers[streamIndex] else { return }
+    defer { inorderParsers[streamIndex] = parser }
+
+    if let videoIdx = videoStreamIndex, streamIndex == videoIdx {
+      guard var depkt = depacketizer else { return }
+      defer { depacketizer = depkt }
+      guard
+        let pkt = try parser.rtp(
+          data: data, ctx: .dummy, streamId: streamIndex, streamCtx: .dummy)
+      else { return }
+      if pkt.payload.isEmpty {
+        warnStreamOnce(
+          "video.empty", .warning, "Empty video RTP payload from camera; packets skipped.")
+      }
+      do {
+        try depkt.push(pkt)
+      } catch {
+        warnStreamOnce(
+          "video.push", .error, "Video depacketizer push failed; packet dropped: \(error)")
+        return
+      }
+      surfaceVideoAnomalies(depkt)
+      while let result = depkt.pull() {
+        switch result {
+        case .success(.videoFrame(let frame)):
+          continuation.yield(.video(convertFrame(frame, depacketizer: depkt)))
+        case .failure(let err):
+          warnStreamOnce(
+            "video.pull", .error, "Video depacketization failed; frame dropped: \(err)")
+        default:
+          break
+        }
+      }
+    } else if let audioIdx = audioStreamIndex, streamIndex == audioIdx {
+      guard var depkt = audioDepacketizer else { return }
+      defer { audioDepacketizer = depkt }
+      guard
+        let pkt = try parser.rtp(
+          data: data, ctx: .dummy, streamId: streamIndex, streamCtx: .dummy)
+      else { return }
+      do {
+        try depkt.push(pkt)
+      } catch {
+        warnStreamOnce(
+          "audio.push", .error, "Audio depacketizer push failed; packet dropped: \(error)")
+        return
+      }
+      while let result = depkt.pull() {
+        switch result {
+        case .success(.audioFrame(let frame)):
+          continuation.yield(
+            .audio(
+              PublicAudioFrame(
+                data: frame.data,
+                timestamp: frame.timestamp.elapsedSeconds,
+                codec: publicAudioCodec(from: audioEncodingName ?? ""),
+                sampleRate: audioClockRate ?? 0,
+                channels: audioChannels,
+                loss: frame.loss)))
+        case .failure(let err):
+          warnStreamOnce(
+            "audio.pull", .error, "Audio depacketization failed; frame dropped: \(err)")
+        default:
+          break
+        }
+      }
+    } else if let applicationIdx = applicationStreamIndex, streamIndex == applicationIdx {
+      guard var depkt = applicationDepacketizer else { return }
+      defer { applicationDepacketizer = depkt }
+      guard
+        let pkt = try parser.rtp(
+          data: data, ctx: .dummy, streamId: streamIndex, streamCtx: .dummy)
+      else { return }
+      do {
+        try depkt.push(pkt)
+      } catch {
+        warnStreamOnce(
+          "metadata.push", .error, "Metadata depacketizer push failed; packet dropped: \(error)")
+        return
+      }
+      while let result = depkt.pull() {
+        switch result {
+        case .success(.metadataFrame(let frame)):
+          continuation.yield(
+            .metadata(
+              PublicMetadataFrame(
+                data: frame.data,
+                timestamp: frame.timestamp.elapsedSeconds,
+                encodingName: applicationEncodingName ?? "",
+                loss: frame.loss)))
+        case .failure(let err):
+          warnStreamOnce(
+            "metadata.pull", .error, "Metadata depacketization failed; frame dropped: \(err)")
+        default:
+          break
+        }
+      }
+    }
+  }
+
+  /// Route one RTCP packet to its stream's parser, yielding a public RTCP item
+  /// when a sender report is parsed. Shared by both reader loops.
+  private func routeRTCP(
+    streamIndex: Int, data: Data,
+    continuation: AsyncThrowingStream<PublicCodecItem, Error>.Continuation
+  ) throws {
+    guard var parser = inorderParsers[streamIndex] else { return }
+    defer { inorderParsers[streamIndex] = parser }
+    if let rtcpPkt = try parser.rtcp(ctx: .dummy, streamId: streamIndex, data: data) {
+      continuation.yield(
+        .rtcp(
+          PublicRTCPPacket(
+            timestamp: rtcpPkt.rtpTimestamp?.elapsedSeconds, data: rtcpPkt.raw)))
+    }
+  }
+
+  func stop() async {
+    let wasPlaying = isPlaying
+    isPlaying = false
+    keepaliveTask?.cancel()
+    keepaliveTask = nil
+
+    if connection != nil, sessionId != nil, let url = self.url {
+      // TEARDOWN (best-effort). While playing, the reader loop owns the socket,
+      // so route the response through it — a competing read here would let the
+      // reader consume the TEARDOWN response and hang this call until the
+      // server's session timeout (~60s). Before PLAY there is no reader, so the
+      // normal request path (which reads its own response) is safe.
+      if wasPlaying {
+        _ = try? await sendControlRequest(method: .teardown, timeoutSeconds: 5)
+      } else {
+        _ = try? await sendRequest(method: .teardown, url: url)
+      }
+    }
+
+    // Closing the socket unblocks the reader's pending receive (it ends cleanly
+    // because isPlaying is now false) and lets us fail any outstanding waiter.
     await connection?.close()
+    failAllPending(RTSPError.unexpectedDisconnection)
     connection = nil
+
+    // Release any UDP RTP/RTCP sockets (no-op for TCP). close() is idempotent,
+    // so the UDP reader loop's defer closing them too is harmless.
+    for pair in udpPairs.values {
+      pair.close()
+    }
+    udpPairs.removeAll()
+  }
+
+  // MARK: - Control channel (keepalive / TEARDOWN while streaming)
+
+  /// Send a control request on the streaming connection and await its response,
+  /// which the `streamFrames` reader loop routes back by CSeq. Used while RTP is
+  /// interleaved on the same TCP socket: the reader owns the socket, so we must
+  /// not issue a competing read here. Bounded by `timeoutSeconds`.
+  private func sendControlRequest(
+    method: RTSPMethod,
+    extraHeaders: [(String, String)] = [],
+    timeoutSeconds: Double = 10
+  ) async throws -> RTSPResponse {
+    guard let conn = connection, let url = self.url else {
+      throw RTSPError.connectionFailed("Not connected")
+    }
+    let cseq = nextCSeq()
+    var request = RTSPRequest(method: method, url: url)
+    request.setHeader("CSeq", value: "\(cseq)")
+    if let userAgent = userAgent, !userAgent.isEmpty {
+      request.setHeader("User-Agent", value: userAgent)
+    }
+    if let sid = sessionId {
+      request.setHeader("Session", value: sid)
+    }
+    if authenticator?.hasChallenge == true,
+      let authHeader = authenticator!.authorize(method: method.rawValue, uri: url)
+    {
+      request.setHeader("Authorization", value: authHeader)
+    }
+    for (name, value) in extraHeaders {
+      request.setHeader(name, value: value)
+    }
+    let data = RTSPSerializer().serialize(request)
+
+    return try await withCheckedThrowingContinuation {
+      (continuation: CheckedContinuation<RTSPResponse, any Error>) in
+      // Register the waiter BEFORE the bytes go out so the reader can never see
+      // the response before we are ready to receive it.
+      pendingResponses[cseq] = continuation
+      Task {
+        do {
+          try await conn.send(data)
+        } catch {
+          self.resumePending(cseq, .failure(.connectionFailed("control send failed: \(error)")))
+        }
+      }
+      pendingTimeouts[cseq] = Task {
+        try? await Task.sleep(for: .seconds(timeoutSeconds))
+        self.resumePending(cseq, .failure(.timeout))
+      }
+    }
+  }
+
+  /// Resume (exactly once) the waiter for `cseq`, if still pending. The
+  /// remove-then-resume is actor-isolated, so the reader, a send failure, and
+  /// the timeout can race safely — the first to run wins, the rest no-op.
+  private func resumePending(_ cseq: UInt32, _ result: Result<RTSPResponse, RTSPError>) {
+    // Cancel the (now-moot) timeout task; its only action after the sleep is a
+    // no-op resumePending, so cancelling is always safe.
+    pendingTimeouts.removeValue(forKey: cseq)?.cancel()
+    guard let continuation = pendingResponses.removeValue(forKey: cseq) else { return }
+    switch result {
+    case .success(let response): continuation.resume(returning: response)
+    case .failure(let error): continuation.resume(throwing: error)
+    }
+  }
+
+  /// Fail every outstanding control waiter (e.g. when the connection is torn
+  /// down), so no `sendControlRequest` is left suspended.
+  private func failAllPending(_ error: RTSPError) {
+    for task in pendingTimeouts.values { task.cancel() }
+    pendingTimeouts.removeAll()
+    let waiters = pendingResponses
+    pendingResponses.removeAll()
+    for (_, continuation) in waiters {
+      continuation.resume(throwing: error)
+    }
+  }
+
+  /// Start the periodic keepalive at roughly half the server's advertised
+  /// session timeout, preferring GET_PARAMETER when the server advertised it,
+  /// else OPTIONS. Runs until the reader loop ends or `stop()` cancels it.
+  private func startKeepalive() {
+    keepaliveTask?.cancel()
+    let period = keepaliveIntervalOverride ?? .seconds(max(1.0, Double(sessionTimeoutSec) / 2.0))
+    let method: RTSPMethod = getParameterSupported ? .getParameter : .options
+    keepaliveTask = Task { [weak self] in
+      while !Task.isCancelled {
+        try? await Task.sleep(for: period)
+        guard !Task.isCancelled, let self else { return }
+        await self.sendKeepalive(method: method)
+      }
+    }
+  }
+
+  /// Send one keepalive request, surfacing the outcome as a diagnostic. Failures
+  /// are non-fatal — the stream keeps running and the next tick retries.
+  private func sendKeepalive(method: RTSPMethod) async {
+    guard isPlaying else { return }
+    do {
+      _ = try await sendControlRequest(method: method, timeoutSeconds: 10)
+      onDiagnostic?(
+        RTSPDiagnostic(
+          severity: .info, message: "RTSP keepalive (\(method.rawValue)) acknowledged"))
+    } catch {
+      onDiagnostic?(
+        RTSPDiagnostic(
+          severity: .warning, message: "RTSP keepalive (\(method.rawValue)) failed: \(error)"))
+    }
   }
 
   // MARK: - Private Helpers
@@ -859,8 +1282,8 @@ actor SessionState {
       request.setHeader("Session", value: sid)
     }
 
-    if let auth = authenticator, auth.hasChallenge {
-      if let authHeader = auth.authorize(method: method.rawValue, uri: url) {
+    if authenticator?.hasChallenge == true {
+      if let authHeader = authenticator!.authorize(method: method.rawValue, uri: url) {
         request.setHeader("Authorization", value: authHeader)
       }
     }
@@ -871,27 +1294,46 @@ actor SessionState {
 
     let resp = try await conn.sendRequest(request)
 
-    // Handle 401 Unauthorized — retry with auth
+    // Handle 401 Unauthorized — retry with auth.
     if resp.statusCode == 401 {
-      if var auth = authenticator,
-        let wwwAuth = resp.header("WWW-Authenticate")
-      {
-        auth.handleChallenge(wwwAuth)
+      if var auth = authenticator {
+        // Feed every challenge (a server may offer Basic and Digest on separate
+        // WWW-Authenticate lines) so Digest wins regardless of ordering.
+        for challenge in resp.headers(named: "WWW-Authenticate") {
+          auth.handleChallenge(challenge)
+        }
         authenticator = auth
-
-        var retryRequest = RTSPRequest(method: method, url: url)
-        retryRequest.setHeader("CSeq", value: "\(nextCSeq())")
-        if let authHeader = auth.authorize(method: method.rawValue, uri: url) {
-          retryRequest.setHeader("Authorization", value: authHeader)
+        if auth.hasChallenge {
+          // Rebuild the retry the same way the first attempt did: a 401 on
+          // SETUP/PLAY requires the Session (and User-Agent) headers preserved,
+          // or the retry is rejected. Authorization is set last so a freshly
+          // computed digest isn't clobbered by a caller-supplied extra header.
+          var retryRequest = RTSPRequest(method: method, url: url)
+          retryRequest.setHeader("CSeq", value: "\(nextCSeq())")
+          if let userAgent = userAgent, !userAgent.isEmpty {
+            retryRequest.setHeader("User-Agent", value: userAgent)
+          }
+          if let sid = sessionId {
+            retryRequest.setHeader("Session", value: sid)
+          }
+          for (name, value) in extraHeaders {
+            retryRequest.setHeader(name, value: value)
+          }
+          if let authHeader = auth.authorize(method: method.rawValue, uri: url) {
+            retryRequest.setHeader("Authorization", value: authHeader)
+          }
+          // Persist after authorize so the advanced nonce-count survives.
+          authenticator = auth
+          let retryResp = try await conn.sendRequest(retryRequest)
+          if retryResp.statusCode == 401 {
+            throw RTSPError.authenticationFailed
+          }
+          guard retryResp.statusCode >= 200 && retryResp.statusCode < 300 else {
+            throw RTSPError.sessionSetupFailed(
+              statusCode: Int(retryResp.statusCode), reason: retryResp.reasonPhrase)
+          }
+          return retryResp
         }
-        for (name, value) in extraHeaders {
-          retryRequest.setHeader(name, value: value)
-        }
-        let retryResp = try await conn.sendRequest(retryRequest)
-        if retryResp.statusCode == 401 {
-          throw RTSPError.authenticationFailed
-        }
-        return retryResp
       }
       throw RTSPError.authenticationFailed
     }
@@ -909,6 +1351,131 @@ actor SessionState {
   private func nextCSeq() -> UInt32 {
     cseq += 1
     return cseq
+  }
+
+  /// SETUP one stream using the selected transport. Returns the parsed SETUP
+  /// response; both paths roll the session id forward and, as a side effect,
+  /// record where the stream's data will arrive (a TCP interleaved channel or a
+  /// bound UDP socket pair in `udpPairs`).
+  private func setupStream(
+    controlURL: String, streamIndex: Int
+  ) async throws -> SetupResponse {
+    switch transport {
+    case .tcp:
+      return try await setupStreamTCP(controlURL: controlURL, streamIndex: streamIndex)
+    case .udp:
+      return try await setupStreamUDP(controlURL: controlURL, streamIndex: streamIndex)
+    }
+  }
+
+  /// Adopt the session id and timeout from a SETUP response, warning when the
+  /// camera renumbers the session mid-handshake.
+  private func adoptSession(_ setup: SetupResponse) {
+    if let prev = sessionId, prev != setup.session.id {
+      onDiagnostic?(
+        RTSPDiagnostic(
+          severity: .warning,
+          message:
+            "Camera issued a new Session ID at SETUP "
+            + "(\(prev) -> \(setup.session.id)); rolling forward."))
+    }
+    sessionId = setup.session.id
+    sessionTimeoutSec = setup.session.timeoutSec
+  }
+
+  /// SETUP one stream over TCP-interleaved transport, assigning its channel
+  /// pair. We request the next free even channel, but adopt the server's
+  /// interleaved channel when it renumbers to a different free even channel so
+  /// routing matches where the data actually arrives (the `Session` header is
+  /// added by `sendRequest`).
+  private func setupStreamTCP(
+    controlURL: String, streamIndex: Int
+  ) async throws -> SetupResponse {
+    let requested = channelMappings.nextUnassigned() ?? 0
+    let headers = [
+      (
+        "Transport",
+        "RTP/AVP/TCP;unicast;interleaved=\(requested)-\(Int(requested) + 1)"
+      )
+    ]
+    let resp = try await sendRequest(
+      method: .setup, url: controlURL, extraHeaders: headers)
+    let setup = try parseSetup(response: resp)
+    adoptSession(setup)
+
+    let channel: UInt8
+    if let server = setup.channelId, server % 2 == 0,
+      channelMappings.lookup(server) == nil
+    {
+      channel = server
+    } else {
+      channel = requested
+    }
+    try channelMappings.assign(channelId: channel, streamIndex: streamIndex)
+    return setup
+  }
+
+  /// SETUP one stream over a UDP socket pair. Binds a local even/odd RTP/RTCP
+  /// pair, advertises it via `client_port`, then connects the sockets to the
+  /// server's `server_port` (RTCP = RTP + 1, enforced by `parseSetup`). The
+  /// connected pair is recorded in `udpPairs`; on any failure its sockets are
+  /// released before rethrowing.
+  ///
+  /// The local socket family (IPv4 / IPv6) is taken from the resolved control
+  /// connection so it matches the server, and the RTP/RTCP peer is chosen from a
+  /// candidate of the same family — IPv4 and IPv6 peers (including `[::1]`) both
+  /// work.
+  private func setupStreamUDP(
+    controlURL: String, streamIndex: Int
+  ) async throws -> SetupResponse {
+    // Pick the local socket family from the resolved control-connection peer
+    // (the same host the server's RTP/RTCP will come from). Fall back to the URL
+    // host's family, then IPv4. Resolved before SETUP since `bind()` needs it.
+    let resolved = await connection?.resolvedRemote()
+    let peerIsIPv6: Bool
+    if let resolved {
+      peerIsIPv6 = resolved.isIPv6
+    } else if let host, UDPPair.isNumericIPv6(host) {
+      peerIsIPv6 = true
+    } else {
+      peerIsIPv6 = false
+    }
+    let family: UDPAddressFamily = peerIsIPv6 ? .ipv6 : .ipv4
+
+    let pair = try await UDPPair.bind(family: family)
+    do {
+      let headers = [
+        ("Transport", "RTP/AVP;unicast;client_port=\(pair.rtpPort)-\(pair.rtcpPort)")
+      ]
+      let resp = try await sendRequest(
+        method: .setup, url: controlURL, extraHeaders: headers)
+      let setup = try parseSetup(response: resp)
+      adoptSession(setup)
+
+      guard let serverRTPPort = setup.serverPort else {
+        throw RTSPError.sessionSetupFailed(
+          statusCode: Int(resp.statusCode),
+          reason: "UDP SETUP response omitted server_port")
+      }
+      // Choose the RTP/RTCP peer. Prefer the server-advertised `source`, then
+      // the resolved control-connection peer, then the URL host — but only a
+      // numeric literal matching the bound socket family, since this path does
+      // not resolve hostnames. The control connection's resolved peer is always
+      // a numeric literal of the right family, so it backstops a hostname URL
+      // (or a `source` given as a name / wrong family).
+      let matchesFamily = peerIsIPv6 ? UDPPair.isNumericIPv6 : UDPPair.isNumericIPv4
+      let peerHost =
+        [setup.source, resolved?.host, host]
+        .compactMap { $0 }
+        .first(where: matchesFamily) ?? resolved?.host ?? family.loopback
+      try await pair.connect(peerHost: peerHost, peerRTPPort: serverRTPPort)
+
+      udpPairs[streamIndex] = pair
+      return setup
+    } catch {
+      pair.close()
+      throw error
+    }
   }
 
   private func convertFrame(
@@ -967,6 +1534,21 @@ actor SessionState {
     default: return .other(encoding)
     }
   }
+}
+
+// MARK: - URL helpers (free functions, testable)
+
+/// Strip the surrounding brackets from an IPv6 literal URL host.
+///
+/// Foundation's URL parser surfaces a bracketed IPv6 host verbatim
+/// (`rtsp://[::1]:554/…` → `[::1]`), but `NWEndpoint.Host` expects the bare
+/// address (e.g. `::1`, or `fe80::1%en0` with a zone id) and rejects the
+/// bracketed form. A non-bracketed host (IPv4 / hostname) is returned unchanged.
+func unbracketedHost(_ host: String) -> String {
+  guard host.hasPrefix("["), host.hasSuffix("]"), host.count >= 2 else {
+    return host
+  }
+  return String(host.dropFirst().dropLast())
 }
 
 // MARK: - Encoding-support predicates (free functions, testable)

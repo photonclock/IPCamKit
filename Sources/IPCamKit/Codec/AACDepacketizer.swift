@@ -26,11 +26,10 @@ struct AACDepacketizer: Sendable {
     }
     let config = try parseAACFormatSpecificParams(
       clockRate: clockRate, formatSpecificParams: fsp)
-    if let ch = channels, ch != config.channels.channels {
-      throw DepacketizeError(
-        "Expected RTP channels \(ch) and AAC channels \(config.channels.channels) to match"
-      )
-    }
+    // RFC 3640: the AudioSpecificConfig in `config=` is authoritative for AAC.
+    // The rtpmap channel count (`channels`) is informational and frequently
+    // wrong or omitted on real cameras, so do not reject on mismatch — trust
+    // the ASC. `channels` is retained in the signature for API compatibility.
     self.config = config
     self.state = .idle(prevLoss: 0, lossSinceMark: false)
   }
@@ -65,7 +64,7 @@ struct AACDepacketizer: Sendable {
 
   /// The received prefix of an AU split across multiple packets.
   private struct Fragment: Sendable {
-    var rtpTimestamp: UInt16
+    var rtpTimestamp: UInt32
     /// Packets lost before this fragment started.
     var loss: UInt16
     /// True iff packets have been lost since the last mark.
@@ -92,8 +91,10 @@ struct AACDepacketizer: Sendable {
       UInt16(payload[payload.startIndex]) << 8
       | UInt16(payload[payload.startIndex + 1])
 
-    // AAC-hbr requires 16-bit AU headers: 13-bit size + 3-bit index
-    guard (auHeadersLengthBits & 0x7) == 0 else {
+    // AAC-hbr headers are 16 bits (13-bit size + 3-bit index), so the declared
+    // AU-headers-length must be a multiple of 16. Enforce that rather than the
+    // looser multiple-of-8, which would silently truncate an off-spec length.
+    guard (auHeadersLengthBits & 0xF) == 0 else {
       throw DepacketizeError("bad au-headers-length \(auHeadersLengthBits)")
     }
     let auHeadersCount = auHeadersLengthBits >> 4
@@ -108,11 +109,13 @@ struct AACDepacketizer: Sendable {
         throw DepacketizeError(
           "Got \(auHeadersCount)-AU packet while fragment in progress")
       }
-      guard UInt16(truncatingIfNeeded: pkt.timestamp.timestamp) == frag.rtpTimestamp else {
+      // Compare the full 32-bit wire timestamp: a UInt16 narrowing could let two
+      // genuinely different timestamps whose low 16 bits collide be mis-stitched.
+      let pktTs = UInt32(truncatingIfNeeded: pkt.timestamp.timestamp)
+      guard pktTs == frag.rtpTimestamp else {
         throw DepacketizeError(
           "Timestamp changed from 0x\(String(frag.rtpTimestamp, radix: 16)) "
-            + "to 0x\(String(UInt16(truncatingIfNeeded: pkt.timestamp.timestamp), radix: 16)) mid-fragment"
-        )
+            + "to 0x\(String(pktTs, radix: 16)) mid-fragment")
       }
       let auHeader =
         UInt16(payload[payload.startIndex + 2]) << 8
@@ -166,7 +169,7 @@ struct AACDepacketizer: Sendable {
       state = .aggregated(
         Aggregate(
           pkt: pkt,
-          loss: prevLoss + loss,
+          loss: UInt16(clamping: UInt32(prevLoss) + UInt32(loss)),
           lossSinceMark: lossSinceMark || loss > 0,
           frameI: 0,
           frameCount: auHeadersCount,
@@ -237,7 +240,7 @@ struct AACDepacketizer: Sendable {
           contentsOf: payload[(payload.startIndex + agg.dataOff)...])
         state = .fragmented(
           Fragment(
-            rtpTimestamp: UInt16(
+            rtpTimestamp: UInt32(
               truncatingIfNeeded: agg.pkt.timestamp.timestamp),
             loss: agg.loss,
             lossSinceMark: agg.lossSinceMark,

@@ -6,12 +6,13 @@ A pure-Swift RTSP client library for streaming live video and audio from IP came
 - **Audio** — AAC, PCMU, PCMA, G.722, G.726, L16, G.723.1
 - **ONVIF analytics metadata** — raw XML documents from the camera's `application` RTSP stream
 - **Optional streams** — any combination of video / audio / metadata is supported; audio-only or metadata-only sessions (e.g. Axis `video=0`) work end-to-end
-- **Zero dependencies** — only Foundation, Network, and CryptoKit
+- **TCP & UDP transport** — RTP/RTCP over RTSP-interleaved TCP or a dedicated UDP socket pair, over IPv4 or IPv6
+- **Zero dependencies** — built only on Apple system frameworks (Foundation, Network, CryptoKit)
 - **Swift 6** — strict concurrency with async/await and AsyncThrowingStream
 
 ## Requirements
 
-- macOS 14.0+
+- macOS 13.0+, iOS 16.0+, tvOS 16.0+, Mac Catalyst 16.0+, visionOS 1.0+
 - Swift 6.0+
 
 ## Installation
@@ -20,7 +21,7 @@ Add IPCamKit as a dependency in your `Package.swift`:
 
 ```swift
 dependencies: [
-    .package(url: "https://github.com/steelbrain/IPCamKit.git", from: "0.1.1"),
+    .package(url: "https://github.com/steelbrain/IPCamKit.git", from: "0.2.0"),
 ]
 ```
 
@@ -103,7 +104,9 @@ See [API.md](API.md) for the full API reference.
 - SDP parsing with codec parameter extraction
 - RTP packet parsing (RFC 3550) with sequence tracking and loss detection
 - RTSP authentication (Basic and Digest with MD5)
-- Transport: TCP interleaved and UDP
+- Automatic session keepalive while streaming (GET_PARAMETER when the server
+  advertises it, else OPTIONS) so long sessions aren't dropped at the timeout
+- Transport: TCP interleaved and UDP, over IPv4 or IPv6
 
 ### Compatibility
 - Tested with Reolink, Dahua, Hikvision, Longse, GW Security, VStarcam, Tenda, Foscam, and others
@@ -132,16 +135,25 @@ Sources/IPCamKit/
 ├── RTP/            RTP/RTCP packets, Timeline, ChannelMapping, InorderParser
 ├── Codec/          H.264/H.265 depacketizers, NAL/SPS/PPS parsing, audio + metadata depacketizers
 ├── Auth/           Basic and Digest authentication
-├── Transport/      NWConnection TCP/UDP transport
+├── Transport/      Network-framework RTSP/TCP control + UDP RTP/RTCP socket pair (IPv4/IPv6)
 └── Client/         RTSP session, DESCRIBE/SETUP/PLAY parsers, Presentation
 ```
 
 ## Testing
 
-100+ tests across 15+ suites covering RTSP parsing, SDP, RTP, H.264/H.265 depacketization, AAC, simple audio, ONVIF metadata depacketization, authentication, and integration:
+165+ tests across 18 suites covering RTSP parsing, SDP, RTP, H.264/H.265 depacketization, AAC, simple audio, ONVIF metadata depacketization, authentication, and the full pipeline:
 
 ```bash
 swift test
+```
+
+The **live integration suite** drives the real `RTSPClientSession` end to end: `ffmpeg`
+publishes a synthetic H.264/H.265/AAC stream to a [mediamtx](https://github.com/bluenviron/mediamtx)
+RTSP server, and the client pulls it back over both RTSP-interleaved TCP and UDP. Both tools
+must be on `PATH`:
+
+```bash
+brew install ffmpeg mediamtx
 ```
 
 ## License

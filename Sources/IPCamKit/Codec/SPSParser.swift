@@ -166,10 +166,11 @@ func parseSPS(_ spsNAL: Data) throws -> ParsedSPS {
     }
     if scalingMatrixPresent == 1 {
       let count = chromaFormatIdc != 3 ? 8 : 12
-      for _ in 0..<count {
+      for i in 0..<count {
         guard let flag = reader.readBits(1) else { break }
         if flag == 1 {
-          let size = count < 8 ? 16 : 64
+          // Scaling lists 0-5 are 4x4 (16 coefficients); the rest are 8x8 (64).
+          let size = i < 6 ? 16 : 64
           skipScalingList(&reader, size: size)
         }
       }
@@ -188,8 +189,10 @@ func parseSPS(_ spsNAL: Data) throws -> ParsedSPS {
     _ = reader.readSignedExpGolomb()  // offset_for_non_ref_pic
     _ = reader.readSignedExpGolomb()  // offset_for_top_to_bottom_field
     if let numRefFrames = reader.readExpGolomb() {
+      // numRefFrames is attacker-controlled; stop as soon as the bitstream
+      // runs out so a bogus count can't spin billions of iterations.
       for _ in 0..<numRefFrames {
-        _ = reader.readSignedExpGolomb()
+        guard reader.readSignedExpGolomb() != nil else { break }
       }
     }
   }
@@ -249,18 +252,22 @@ func parseSPS(_ spsNAL: Data) throws -> ParsedSPS {
     }
   }
 
-  let mbWidth = picWidthMinus1 + 1
-  let mbHeight = picHeightMinus1 + 1
-  let heightMultiplier: UInt32 = frameMbsOnlyFlag == 1 ? 1 : 2
+  // Compute dimensions in Int (64-bit) so malformed SPS values can't overflow
+  // or underflow and trap; then require the result to fit the UInt16 type.
   // CropUnitX = SubWidthC, CropUnitY = SubHeightC * (2 - frame_mbs_only_flag)
-  let rawWidth = mbWidth * 16 - (cropLeft + cropRight) * subWidthC
+  let mbWidth = Int(picWidthMinus1) + 1
+  let mbHeight = Int(picHeightMinus1) + 1
+  let heightMultiplier = frameMbsOnlyFlag == 1 ? 1 : 2
+  let rawWidth = mbWidth * 16 - (Int(cropLeft) + Int(cropRight)) * Int(subWidthC)
   let rawHeight =
-    mbHeight * 16 * heightMultiplier - (cropTop + cropBottom) * subHeightC
-    * heightMultiplier
+    mbHeight * 16 * heightMultiplier
+    - (Int(cropTop) + Int(cropBottom)) * Int(subHeightC) * heightMultiplier
 
-  guard let width = UInt16(exactly: rawWidth), let height = UInt16(exactly: rawHeight) else {
+  guard rawWidth > 0, rawHeight > 0,
+    let width = UInt16(exactly: rawWidth), let height = UInt16(exactly: rawHeight)
+  else {
     throw RTSPError.depacketizationError(
-      "SPS dimensions too large: \(rawWidth)x\(rawHeight)")
+      "SPS dimensions invalid: \(rawWidth)x\(rawHeight)")
   }
 
   // VUI parameters (optional)
@@ -303,10 +310,11 @@ func parseSPS(_ spsNAL: Data) throws -> ParsedSPS {
       if let numUnitsInTick = reader.readBits(32),
         let timeScale = reader.readBits(32)
       {
-        if numUnitsInTick > 0 && timeScale > 0 {
-          // frame_rate = time_scale / (2 * num_units_in_tick)
-          // We store as (num_units_in_tick * 2, time_scale) to represent the denominator/numerator
-          frameRate = (num: numUnitsInTick * 2, den: timeScale)
+        // frame_rate = time_scale / (2 * num_units_in_tick); stored as
+        // (num_units_in_tick * 2, time_scale). Skip if the doubling overflows.
+        let (doubledUnits, overflow) = numUnitsInTick.multipliedReportingOverflow(by: 2)
+        if numUnitsInTick > 0 && timeScale > 0 && !overflow {
+          frameRate = (num: doubledUnits, den: timeScale)
         }
       }
     }
@@ -325,12 +333,14 @@ func parseSPS(_ spsNAL: Data) throws -> ParsedSPS {
 
 /// Skip a scaling list in the SPS.
 private func skipScalingList(_ reader: inout BitReader, size: Int) {
-  var lastScale: Int32 = 8
-  var nextScale: Int32 = 8
+  // Run the scale math in Int so a large signed exp-Golomb delta from
+  // malformed input can't overflow Int32 and trap.
+  var lastScale = 8
+  var nextScale = 8
   for _ in 0..<size {
     if nextScale != 0 {
       let delta = reader.readSignedExpGolomb() ?? 0
-      nextScale = (lastScale + delta + 256) % 256
+      nextScale = ((lastScale + Int(delta) + 256) % 256 + 256) % 256
     }
     lastScale = nextScale != 0 ? nextScale : lastScale
   }

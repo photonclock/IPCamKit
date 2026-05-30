@@ -23,8 +23,8 @@ let staticPayloadTypes: [Int: StaticPayloadType] = [
   7: StaticPayloadType(media: "audio", encoding: "lpc", clockRate: 8000, channels: 1),
   8: StaticPayloadType(media: "audio", encoding: "pcma", clockRate: 8000, channels: 1),
   9: StaticPayloadType(media: "audio", encoding: "g722", clockRate: 8000, channels: 1),
-  10: StaticPayloadType(media: "audio", encoding: "l16", clockRate: 441_000, channels: 2),
-  11: StaticPayloadType(media: "audio", encoding: "l16", clockRate: 441_000, channels: 1),
+  10: StaticPayloadType(media: "audio", encoding: "l16", clockRate: 44_100, channels: 2),
+  11: StaticPayloadType(media: "audio", encoding: "l16", clockRate: 44_100, channels: 1),
   12: StaticPayloadType(media: "audio", encoding: "qcelp", clockRate: 8000, channels: 1),
   13: StaticPayloadType(media: "audio", encoding: "cn", clockRate: 8000, channels: 1),
   14: StaticPayloadType(media: "audio", encoding: "mpa", clockRate: 90000, channels: nil),
@@ -57,8 +57,8 @@ func parseMedia(
       "Unsupported protocol \(mediaDescription.proto) for \(media)")
   }
 
-  // Get first payload type from fmt field
-  let fmtParts = mediaDescription.fmt.split(separator: " ")
+  // Get first payload type from fmt field (tolerate tab/space separators).
+  let fmtParts = mediaDescription.fmt.split(whereSeparator: { $0 == " " || $0 == "\t" })
   guard let firstFmt = fmtParts.first else {
     throw RTSPError.invalidSDP("Empty fmt in media line")
   }

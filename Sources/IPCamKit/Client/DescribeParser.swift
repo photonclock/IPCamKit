@@ -14,7 +14,8 @@ import Foundation
 /// - Returns: A Presentation with all parsed streams
 func parseDescribe(
   requestURL: String,
-  response: RTSPResponse
+  response: RTSPResponse,
+  onDiagnostic: (@Sendable (RTSPDiagnostic) -> Void)? = nil
 ) throws -> Presentation {
   // Validate content type (warn if missing, error if wrong)
   if let ct = response.contentType {
@@ -25,11 +26,23 @@ func parseDescribe(
   }
   // Note: upstream logs a warning for missing Content-Type but still continues
 
-  // Determine base URL from Content-Base or Content-Location header
-  let baseURL =
-    response.header("Content-Base")?.trimmingCharacters(in: .whitespaces)
+  // Determine base URL from Content-Base or Content-Location header. Some
+  // cameras (e.g. Anjvision) send a scheme-less value such as
+  // "192.168.1.10:554/stream0/"; resolve those against the request URL's
+  // scheme instead of rejecting them. Port of retina 6972ac4.
+  let baseURL: String
+  if let raw = response.header("Content-Base")?.trimmingCharacters(in: .whitespaces)
     ?? response.header("Content-Location")?.trimmingCharacters(in: .whitespaces)
-    ?? requestURL
+  {
+    if hasURIScheme(raw) {
+      baseURL = raw
+    } else {
+      let scheme = requestURL.prefix(while: { $0 != ":" })
+      baseURL = scheme.isEmpty ? raw : "\(scheme)://\(raw)"
+    }
+  } else {
+    baseURL = requestURL
+  }
 
   // Parse SDP body
   guard !response.body.isEmpty else {
@@ -65,7 +78,15 @@ func parseDescribe(
       let stream = try parseMedia(baseURL: baseURL, mediaDescription: mediaDesc)
       streams.append(stream)
     } catch {
+      // A stream the camera offered that we can't parse (unsupported codec, bad
+      // rtpmap, ...) is dropped. If at least one other stream parses the session
+      // still starts, so surface the drop rather than losing it silently.
       errors.append(error.localizedDescription)
+      onDiagnostic?(
+        RTSPDiagnostic(
+          severity: .warning,
+          message: "Dropping unparseable \(mediaDesc.media) stream from SDP: "
+            + error.localizedDescription))
     }
   }
 
@@ -80,4 +101,15 @@ func parseDescribe(
     control: sessionControl,
     tool: tool
   )
+}
+
+/// Whether `s` begins with a URI scheme (`scheme:` where the scheme starts with
+/// a letter), per RFC 3986. Used to distinguish an absolute Content-Base from a
+/// scheme-less one like "192.168.1.10:554/stream0/" (which has a `:` for the
+/// port but no scheme). Mirrors retina's `Url::parse` succeed/fail check.
+func hasURIScheme(_ s: String) -> Bool {
+  guard let colon = s.firstIndex(of: ":") else { return false }
+  let scheme = s[s.startIndex..<colon]
+  guard let first = scheme.first, first.isLetter else { return false }
+  return scheme.allSatisfy { $0.isLetter || $0.isNumber || $0 == "+" || $0 == "-" || $0 == "." }
 }

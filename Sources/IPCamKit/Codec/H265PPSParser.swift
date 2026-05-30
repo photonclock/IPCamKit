@@ -54,11 +54,13 @@ func parseH265PPS(_ rbsp: Data) throws -> H265Pps {
       throw RTSPError.depacketizationError("PPS: can't read uniform_spacing_flag")
     }
     if !uniformSpacing {
+      // numTileColumns/Rows are attacker-controlled exp-Golomb values; stop as
+      // soon as the bitstream runs out so a bogus count can't spin.
       for _ in 0..<numTileColumns {
-        _ = reader.readExpGolomb()  // column_width_minus1
+        guard reader.readExpGolomb() != nil else { break }  // column_width_minus1
       }
       for _ in 0..<numTileRows {
-        _ = reader.readExpGolomb()  // row_height_minus1
+        guard reader.readExpGolomb() != nil else { break }  // row_height_minus1
       }
     }
     _ = reader.readBool()  // loop_filter_across_tiles_enabled_flag

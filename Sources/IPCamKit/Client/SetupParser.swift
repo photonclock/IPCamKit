@@ -29,12 +29,10 @@ func parseSetup(response: RTSPResponse) throws -> SetupResponse {
         let key = kv[0].trimmingCharacters(in: .whitespaces).lowercased()
         let value = kv[1].trimmingCharacters(in: .whitespaces)
         if key == "timeout" {
-          if let t = UInt32(value) {
-            guard t > 0 else {
-              throw RTSPError.sessionSetupFailed(
-                statusCode: Int(response.statusCode),
-                reason: "Session timeout=0 is invalid")
-            }
+          // Some cameras/proxies send timeout=0 to mean "no expiry / no
+          // keepalive needed". Treat 0 (and an unparseable value) as "use the
+          // default cadence" instead of aborting SETUP.
+          if let t = UInt32(value), t > 0 {
             timeoutSec = t
           }
         }
@@ -68,16 +66,24 @@ func parseSetup(response: RTSPResponse) throws -> SetupResponse {
       // SSRC is hex, may have leading whitespace
       ssrc = UInt32(value.trimmingCharacters(in: .whitespaces), radix: 16)
     case "interleaved":
-      // Format: "0-1" (RTP channel - RTCP channel, must be consecutive)
+      // Format: "0-1" (RTP channel - RTCP channel). The RTCP channel is
+      // optional; when present it must be consecutive (matching retina). Routing
+      // is parity-based, so only the RTP channel is kept.
       let channels = value.split(separator: "-")
-      guard channels.count == 2,
-        let first = UInt8(channels[0].trimmingCharacters(in: .whitespaces)),
-        let second = UInt8(channels[1].trimmingCharacters(in: .whitespaces)),
-        second == first + 1
+      guard let first = UInt8(channels.first?.trimmingCharacters(in: .whitespaces) ?? "")
       else {
         throw RTSPError.sessionSetupFailed(
           statusCode: Int(response.statusCode),
           reason: "Invalid interleaved channels: \(value)")
+      }
+      if channels.count >= 2 {
+        guard let second = UInt8(channels[1].trimmingCharacters(in: .whitespaces)),
+          Int(second) == Int(first) + 1
+        else {
+          throw RTSPError.sessionSetupFailed(
+            statusCode: Int(response.statusCode),
+            reason: "Invalid interleaved channels: \(value)")
+        }
       }
       channelId = first
     case "source":
@@ -88,7 +94,7 @@ func parseSetup(response: RTSPResponse) throws -> SetupResponse {
       guard ports.count == 2,
         let first = UInt16(ports[0].trimmingCharacters(in: .whitespaces)),
         let second = UInt16(ports[1].trimmingCharacters(in: .whitespaces)),
-        second == first + 1
+        Int(second) == Int(first) + 1
       else {
         throw RTSPError.sessionSetupFailed(
           statusCode: Int(response.statusCode),

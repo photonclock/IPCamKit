@@ -16,6 +16,18 @@ struct H265Depacketizer: Sendable {
   private var pieces: [Data]
   private var nals: [NALEntry]
   var seenInconsistentFuNalHdr: Bool
+  /// True once a FU with both the START and END bits set has been seen (a
+  /// single-fragment FU, forbidden by RFC 7798 section 4.4.3 but emitted by
+  /// some cameras). Tracked so callers can surface it as a diagnostic.
+  var seenSingleFragmentFu: Bool
+  /// Running total of buffered NAL-body bytes for the in-progress access unit,
+  /// used to bound memory against a hostile camera (see `maxAccessUnitBytes`).
+  private var pendingBytes: Int = 0
+
+  /// Cap on a single accumulated access unit. A hostile camera could otherwise
+  /// stream FU continuations (or same-timestamp NALs) forever and grow memory
+  /// without bound. 16 MiB sits well above any real 4K/8K keyframe.
+  private static let maxAccessUnitBytes = 16 << 20
 
   init(clockRate: UInt32, formatSpecificParams: String?) throws {
     guard clockRate == 90_000 else {
@@ -27,6 +39,7 @@ struct H265Depacketizer: Sendable {
     self.pieces = []
     self.nals = []
     self.seenInconsistentFuNalHdr = false
+    self.seenSingleFragmentFu = false
 
     if let fmtp = formatSpecificParams {
       self.parameters = try? H265Parameters.parseFormatSpecificParams(fmtp)
@@ -68,7 +81,7 @@ struct H265Depacketizer: Sendable {
       AccessUnit(
         startCtx: pkt.ctx, endCtx: pkt.ctx,
         timestamp: pkt.timestamp, streamId: pkt.streamId,
-        inFU: false, loss: pkt.loss + additionalLoss,
+        inFU: false, loss: UInt16(clamping: UInt32(pkt.loss) + UInt32(additionalLoss)),
         sameTsAsPrev: sameTsAsPrev)
     }
   }
@@ -77,16 +90,47 @@ struct H265Depacketizer: Sendable {
 
   mutating func push(_ pkt: ReceivedRTPPacket) throws {
     let result = pushInner(pkt)
+    if case .failure(let err) = result {
+      // Reset to a clean state so a later push() cannot build on a buffer left
+      // partially mutated by the failed push (matters once errors are
+      // recoverable).
+      resetAccumulation()
+      inputState = .new
+      throw err
+    }
     if case .preMark = inputState {
     } else {
-      nals.removeAll(keepingCapacity: true)
-      pieces.removeAll(keepingCapacity: true)
-    }
-    if case .failure(let err) = result {
-      throw err
+      resetAccumulation()
     }
   }
 
+  /// Clear the in-progress access-unit buffers and the byte accumulator together,
+  /// so the running total can never drift from the actual buffered bytes.
+  private mutating func resetAccumulation() {
+    nals.removeAll(keepingCapacity: true)
+    pieces.removeAll(keepingCapacity: true)
+    pendingBytes = 0
+  }
+
+  /// Append a NAL-body piece, enforcing the per-access-unit size cap so a
+  /// never-terminating FU or a flood of NALs at one timestamp can't exhaust
+  /// memory.
+  private mutating func appendPiece(_ piece: Data) -> Result<Void, DepacketizeError> {
+    guard pendingBytes + piece.count <= Self.maxAccessUnitBytes else {
+      return .failure(
+        DepacketizeError("H.265 access unit exceeded \(Self.maxAccessUnitBytes) bytes"))
+    }
+    pieces.append(piece)
+    pendingBytes += piece.count
+    return .success(())
+  }
+
+  /// Returns the next completed item, or nil when none are buffered.
+  ///
+  /// Contract: callers MUST drain `pull()` to nil after each `push()` (as
+  /// RTSPSession does). The internal `pending` buffer is unbounded; not draining
+  /// lets it grow without limit. This type is module-internal with a single
+  /// driver that upholds the invariant.
   mutating func pull() -> Result<CodecItem, DepacketizeError>? {
     guard !pending.isEmpty else { return nil }
     let item = pending.removeFirst()
@@ -117,8 +161,7 @@ struct H265Depacketizer: Sendable {
       au.endCtx = pkt.ctx
       let loss = pkt.loss
       if loss > 0 {
-        nals.removeAll(keepingCapacity: true)
-        pieces.removeAll(keepingCapacity: true)
+        resetAccumulation()
         if sameTimestamp(pkt.timestamp, au.timestamp) {
           if pkt.mark {
             inputState = .postMark(timestamp: au.timestamp, loss: loss)
@@ -133,16 +176,14 @@ struct H265Depacketizer: Sendable {
           let desc =
             "timestamp changed from \(au.timestamp) to \(pkt.timestamp) in the middle of a fragmented NAL"
           pending.append(.failure(DepacketizeError(desc)))
-          nals.removeAll(keepingCapacity: true)
-          pieces.removeAll(keepingCapacity: true)
+          resetAccumulation()
           accessUnit = AccessUnit.start(pkt, additionalLoss: 0, sameTsAsPrev: false)
         } else if nals.isEmpty {
           return .failure(DepacketizeError("nals should not be empty"))
         } else if canEndAU(nals.last!.hdr.unitType) {
           let frame = finalizeAccessUnit(&au)
           pending.append(frame)
-          nals.removeAll(keepingCapacity: true)
-          pieces.removeAll(keepingCapacity: true)
+          resetAccumulation()
           accessUnit = AccessUnit.start(pkt, additionalLoss: 0, sameTsAsPrev: false)
         } else {
           au.timestamp = pkt.timestamp
@@ -159,7 +200,7 @@ struct H265Depacketizer: Sendable {
 
     case .loss(let lossTs, var lossPkts):
       if sameTimestamp(pkt.timestamp, lossTs) {
-        lossPkts += pkt.loss
+        lossPkts = UInt16(clamping: UInt32(lossPkts) + UInt32(pkt.loss))
         inputState = .loss(timestamp: lossTs, pkts: lossPkts)
         return .success(())
       }
@@ -192,12 +233,18 @@ struct H265Depacketizer: Sendable {
       let body = Data(payload[(payload.startIndex + 2)...])
       let len = body.count + 2  // includes 2-byte header
       if !body.isEmpty {
-        pieces.append(body)
+        if case .failure(let e) = appendPiece(body) { return .failure(e) }
       }
       nals.append(NALEntry(hdr: hdr, nextPieceIdx: pieces.count, len: len))
 
     case 48:
       // Aggregation Packet (RFC 7798 section 4.4.2)
+      if accessUnit.inFU {
+        // An AP arriving mid-fragment would leave the in-progress FU NALEntry
+        // with its Int.max sentinel nextPieceIdx, which finalizeAccessUnit
+        // would then slice on and trap. Reject like the single-NAL branch.
+        return .failure(DepacketizeError("AP while fragment in progress"))
+      }
       var offset = payload.startIndex + 2  // skip outer NAL header
       guard offset < payload.endIndex else {
         return .failure(
@@ -235,7 +282,7 @@ struct H265Depacketizer: Sendable {
           ? Data(nalData[(nalData.startIndex + 2)...])
           : Data()
         if !innerBody.isEmpty {
-          pieces.append(innerBody)
+          if case .failure(let e) = appendPiece(innerBody) { return .failure(e) }
         }
         nals.append(
           NALEntry(
@@ -259,31 +306,37 @@ struct H265Depacketizer: Sendable {
       }
       let reconstructedHdr = hdr.withUnitType(fuType)
 
-      if isStart && isEnd {
-        return .failure(
-          DepacketizeError(
-            "Invalid FU header \(String(format: "%02x", fuHeader))"))
-      }
+      // A FU with both START and END set is a single-fragment FU: forbidden by
+      // RFC 7798 section 4.4.3, but some cameras wrap small NALs this way.
+      // Tolerate it (treat as a complete NAL) instead of erroring. Port of
+      // retina 8ff7a0f / e1c0bbf.
       if !isEnd && pkt.mark {
         return .failure(DepacketizeError("FU pkt with MARK && !END"))
       }
 
       let fuPayload = Data(payload[(payload.startIndex + 3)...])
 
+      // `pieces` count once this fragment's payload has been appended; used to
+      // close out the NAL's piece range on the END fragment (possibly now).
+      let piecesLen: Int
       switch (isStart, accessUnit.inFU) {
       case (true, true):
         return .failure(
           DepacketizeError("FU with start bit while frag in progress"))
       case (true, false):
-        pieces.append(fuPayload)
+        if isEnd && !seenSingleFragmentFu {
+          seenSingleFragmentFu = true
+        }
+        if case .failure(let e) = appendPiece(fuPayload) { return .failure(e) }
         nals.append(
           NALEntry(
             hdr: reconstructedHdr,
-            nextPieceIdx: Int.max,  // overwritten on end
+            nextPieceIdx: Int.max,  // overwritten on end (which may be now)
             len: 2 + fuPayload.count))
-        accessUnit.inFU = true
+        piecesLen = pieces.count
       case (false, true):
-        pieces.append(fuPayload)
+        if case .failure(let e) = appendPiece(fuPayload) { return .failure(e) }
+        piecesLen = pieces.count
         guard var nal = nals.last else {
           return .failure(DepacketizeError("nals non-empty while in fu"))
         }
@@ -291,21 +344,24 @@ struct H265Depacketizer: Sendable {
           seenInconsistentFuNalHdr = true
         }
         nal.len += fuPayload.count
-        if isEnd {
-          nal.nextPieceIdx = pieces.count
-          accessUnit.inFU = false
-        }
         nals[nals.count - 1] = nal
       case (false, false):
         if pkt.loss > 0 {
-          nals.removeAll(keepingCapacity: true)
-          pieces.removeAll(keepingCapacity: true)
+          resetAccumulation()
           inputState = .loss(timestamp: accessUnit.timestamp, pkts: pkt.loss)
           return .success(())
         }
         return .failure(
           DepacketizeError("FU has start bit unset while no frag in progress"))
       }
+
+      if isEnd {
+        guard !nals.isEmpty else {
+          return .failure(DepacketizeError("FU end with no NAL in progress"))
+        }
+        nals[nals.count - 1].nextPieceIdx = piecesLen
+      }
+      accessUnit.inFU = !isEnd
 
     default:
       return .failure(DepacketizeError("unexpected/bad nal header type \(nalTypeRaw)"))
@@ -409,8 +465,7 @@ struct H265Depacketizer: Sendable {
       pieceIdx = nextPieceIdx
     }
 
-    nals.removeAll(keepingCapacity: true)
-    pieces.removeAll(keepingCapacity: true)
+    resetAccumulation()
 
     // Update parameters if changed
     let allNew = newVPS != nil && newSPS != nil && newPPS != nil

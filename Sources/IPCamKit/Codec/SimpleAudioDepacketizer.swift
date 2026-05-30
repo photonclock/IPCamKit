@@ -30,10 +30,11 @@ struct SimpleAudioDepacketizer: Sendable {
   /// Computes the frame length in samples from the payload byte count.
   ///
   /// Returns nil if the payload size is not evenly divisible by bitsPerSample,
-  /// or if the result would be zero.
-  /// Precondition: payloadLen < UInt16.max (matching upstream assert!).
+  /// if the result would be zero, or if the payload is too large to be a valid
+  /// RTP payload (>= UInt16.max). A malformed/oversized length degrades to a
+  /// thrown DepacketizeError via push() rather than trapping the process.
   func frameLength(payloadLen: Int) -> UInt32? {
-    precondition(payloadLen < Int(UInt16.max))
+    guard payloadLen < Int(UInt16.max) else { return nil }
     let bits = UInt32(payloadLen) * 8
     guard bits % bitsPerSample == 0 else { return nil }
     let result = bits / bitsPerSample
@@ -52,8 +53,11 @@ struct SimpleAudioDepacketizer: Sendable {
       streamId: pkt.streamId,
       timestamp: pkt.timestamp,
       frameLength: fl,
+      // Normalize to a standalone Data (startIndex 0); the payload is a slice
+      // of the receive buffer, and handing a nonzero-startIndex slice to the
+      // public frame is a subscripting footgun for consumers.
       loss: pkt.loss,
-      data: payload
+      data: Data(payload)
     )
   }
 

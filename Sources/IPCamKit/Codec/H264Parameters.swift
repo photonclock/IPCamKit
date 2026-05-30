@@ -83,21 +83,17 @@ struct H264Parameters: Sendable, Equatable {
   ///
   /// Builds AVCDecoderConfiguration record (ISO/IEC 14496-15 section 5.2.4.1).
   static func parseSPSAndPPS(sps spsNAL: Data, pps ppsNAL: Data) throws -> H264Parameters {
-    // Decode SPS RBSP (skip NAL header byte for rbsp decoding)
-    let spsRBSP = decodeRBSP(spsNAL)
-    guard spsRBSP.count >= 4 else {
-      throw RTSPError.depacketizationError("SPS RBSP too short")
-    }
+    // Parse the SPS once: parseSPS already decodes the RBSP and returns the
+    // profile/constraint/level bytes along with dimensions and VUI, so there is
+    // no need to decode and slice the RBSP a second time here.
+    let parsedSPS = try parseSPS(spsNAL)
+    let profileIdc = parsedSPS.profileIdc
+    let constraintFlags = parsedSPS.constraintFlags
+    let levelIdc = parsedSPS.levelIdc
 
-    // Build RFC 6381 codec string from first 3 bytes of SPS RBSP (after NAL header)
-    let profileIdc = spsRBSP[spsRBSP.startIndex + 1]
-    let constraintFlags = spsRBSP[spsRBSP.startIndex + 2]
-    let levelIdc = spsRBSP[spsRBSP.startIndex + 3]
+    // Build RFC 6381 codec string
     let rfc6381Codec = String(
       format: "avc1.%02X%02X%02X", profileIdc, constraintFlags, levelIdc)
-
-    // Parse SPS for dimensions and VUI
-    let parsedSPS = try parseSPS(spsNAL)
 
     // Build AVCDecoderConfiguration
     //  configurationVersion = 1

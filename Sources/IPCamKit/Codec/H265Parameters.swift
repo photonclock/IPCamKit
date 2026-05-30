@@ -22,17 +22,29 @@ struct H265Parameters: Sendable, Equatable {
 
     for p in fmtp.split(separator: ";") {
       let trimmed = p.trimmingCharacters(in: .whitespaces)
-      guard let eqIdx = trimmed.firstIndex(of: "=") else {
-        throw RTSPError.depacketizationError("key \(trimmed) without value")
-      }
-      let key = trimmed[..<eqIdx].trimmingCharacters(in: .whitespaces)
+      if trimmed.isEmpty { continue }  // tolerate a trailing ';'
+      // Skip flag-style tokens lacking '=' rather than rejecting the whole fmtp
+      // (matches the H264 parser; a real camera's stray token must not drop the
+      // parameter sets).
+      guard let eqIdx = trimmed.firstIndex(of: "=") else { continue }
+      // Match keys case-insensitively (cameras emit Sprop-VPS, tx-mode=srst).
+      // The value keeps its case — base64 NALs are case-significant.
+      let key = trimmed[..<eqIdx].trimmingCharacters(in: .whitespaces).lowercased()
       let value = trimmed[trimmed.index(after: eqIdx)...].trimmingCharacters(in: .whitespaces)
 
       switch key {
       case "tx-mode":
-        guard value == "SRST" else {
+        guard value.uppercased() == "SRST" else {
           throw RTSPError.depacketizationError(
             "unsupported/unexpected tx-mode \(value); expected SRST")
+        }
+      case "sprop-max-don-diff":
+        // DONL/DOND decoding is not implemented (SRST without DON only). A camera
+        // advertising >0 prepends a DONL to every FU/AP, which we'd misread as
+        // NAL data — fail loud rather than silently emit corrupt frames.
+        if let n = Int(value), n > 0 {
+          throw RTSPError.depacketizationError(
+            "unsupported sprop-max-don-diff=\(n); DONL/DOND decoding not implemented")
         }
       case "sprop-vps":
         try storeSpropNAL(key: "sprop-vps", value: value, out: &vpsNAL)
@@ -61,17 +73,44 @@ struct H265Parameters: Sendable, Equatable {
   private static func storeSpropNAL(
     key: String, value: String, out: inout Data?
   ) throws {
-    guard let decoded = Data(base64Encoded: value) else {
-      throw RTSPError.depacketizationError(
-        "bad parameter \(key): NAL has invalid base64 encoding")
-    }
-    guard !decoded.isEmpty else {
-      throw RTSPError.depacketizationError("bad parameter \(key): empty NAL")
-    }
     guard out == nil else {
       throw RTSPError.depacketizationError("multiple \(key) parameters")
     }
-    out = decoded
+    // RFC 7798 7.1: the value is a comma-separated list of base64 NAL units.
+    // Take the first valid NAL — the struct holds a single VPS/SPS/PPS, and the
+    // RFC requires later entries be consistent with the first.
+    for element in value.split(separator: ",") {
+      let b64 = element.trimmingCharacters(in: .whitespaces)
+      guard !b64.isEmpty else { continue }
+      guard let decoded = Data(base64Encoded: b64) else {
+        throw RTSPError.depacketizationError(
+          "bad parameter \(key): NAL has invalid base64 encoding")
+      }
+      let nal = stripAnnexBStartCode(decoded)
+      guard !nal.isEmpty else {
+        throw RTSPError.depacketizationError("bad parameter \(key): empty NAL")
+      }
+      out = nal
+      break
+    }
+    guard out != nil else {
+      throw RTSPError.depacketizationError("bad parameter \(key): no NAL units")
+    }
+  }
+
+  /// Strip a single leading Annex B start code (`00 00 01` or `00 00 00 01`)
+  /// that some cameras prepend to a base64 sprop NAL, mirroring the H264 path.
+  /// Only a leading prefix is removed, so trailing bytes (and emulation-
+  /// prevention sequences) of a bare NAL are left untouched.
+  private static func stripAnnexBStartCode(_ d: Data) -> Data {
+    let s = d.startIndex
+    if d.count >= 4, d[s] == 0, d[s + 1] == 0, d[s + 2] == 0, d[s + 3] == 1 {
+      return d.subdata(in: (s + 4)..<d.endIndex)
+    }
+    if d.count >= 3, d[s] == 0, d[s + 1] == 0, d[s + 2] == 1 {
+      return d.subdata(in: (s + 3)..<d.endIndex)
+    }
+    return d
   }
 
   /// Parse VPS, SPS, and PPS NALs and build parameters.
@@ -99,6 +138,14 @@ struct H265Parameters: Sendable, Equatable {
     }
     let ppsRBSP = decodeRBSP(ppsBody)
     let pps = try parseH265PPS(ppsRBSP)
+
+    // The HEVCDecoderConfigurationRecord stores each NAL length in a u16, so a
+    // parameter NAL over 65535 bytes would trap building it. Reject up front,
+    // mirroring the H264 path. (No real camera emits a >64 KiB parameter set.)
+    guard vpsNAL.count <= 0xFFFF, spsNAL.count <= 0xFFFF, ppsNAL.count <= 0xFFFF else {
+      throw RTSPError.depacketizationError(
+        "VPS/SPS/PPS NAL exceeds 65535 bytes; cannot fit the HEVC record u16 length")
+    }
 
     let rfc6381Codec = sps.rfc6381Codec()
     let dims = try sps.pixelDimensions()

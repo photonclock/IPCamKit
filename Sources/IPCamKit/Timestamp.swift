@@ -64,7 +64,7 @@ public struct Timestamp: Sendable, Equatable, CustomStringConvertible, CustomDeb
 
 /// The Unix epoch as an NTP timestamp.
 /// NTP epoch is 1900-01-01, Unix epoch is 1970-01-01, difference is 2,208,988,800 seconds.
-public let ntpUnixEpoch = NtpTimestamp(rawValue: 2_208_988_800 << 32)
+private let ntpUnixEpoch = NtpTimestamp(rawValue: 2_208_988_800 << 32)
 
 /// A wallclock time in Network Time Protocol format.
 ///
@@ -79,9 +79,14 @@ public struct NtpTimestamp: Sendable, Equatable, Comparable, CustomStringConvert
     self.rawValue = rawValue
   }
 
-  /// Convert to a Foundation Date (assumes time is within 68 years of 1970).
+  /// Convert to a Foundation Date. NTP times before the Unix epoch — e.g. an
+  /// unsynced camera that sends 0 — are clamped to 1970-01-01 rather than
+  /// wrapping to an absurd far-future date.
   public var date: Date {
-    let sinceEpoch = rawValue &- ntpUnixEpoch.rawValue
+    guard rawValue >= ntpUnixEpoch.rawValue else {
+      return Date(timeIntervalSince1970: 0)
+    }
+    let sinceEpoch = rawValue - ntpUnixEpoch.rawValue
     let seconds = Double(sinceEpoch >> 32)
     let fraction = Double(sinceEpoch & 0xFFFF_FFFF) / Double(UInt64(1) << 32)
     return Date(timeIntervalSince1970: seconds + fraction)

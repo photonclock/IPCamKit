@@ -9,11 +9,22 @@ on:
 jobs:
   build-and-test:
     name: Build & Test
+    # Run for pushes (post-merge to main) and for pull requests whose head
+    # branch lives in this repo. Pull requests from forks (foreign branches)
+    # have a different head repo and are skipped, so they never reach the
+    # macOS runner or install dependencies.
+    if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository
     runs-on: macos-15
     steps:
       - uses: actions/checkout@v4
         with:
           submodules: false
+
+      # The live integration tests publish a synthetic stream with ffmpeg to a
+      # mediamtx RTSP server and pull it back through RTSPClientSession, so both
+      # tools must be on PATH. See README "Testing".
+      - name: Install integration test dependencies
+        run: brew install ffmpeg mediamtx
 
       - name: Build
         run: swift build -v
@@ -23,6 +34,7 @@ jobs:
 
   lint:
     name: Lint
+    if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository
     runs-on: macos-15
     steps:
       - uses: actions/checkout@v4

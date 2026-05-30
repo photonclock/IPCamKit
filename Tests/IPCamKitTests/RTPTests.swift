@@ -200,6 +200,18 @@ struct TimelineTests {
     #expect(Int32(truncatingIfNeeded: a) == -1)
     #expect(Int32(truncatingIfNeeded: b) == 0)
   }
+
+  /// An unsynced camera commonly sends an NTP timestamp before (or at) the Unix
+  /// epoch; it must clamp to 1970 rather than wrapping to a far-future date
+  /// (finding #51).
+  @Test("NtpTimestamp before the Unix epoch clamps to 1970")
+  func ntpBeforeEpochClamps() {
+    let epochRaw: UInt64 = 2_208_988_800 << 32
+    #expect(NtpTimestamp(rawValue: 0).date == Date(timeIntervalSince1970: 0))
+    #expect(NtpTimestamp(rawValue: epochRaw).date == Date(timeIntervalSince1970: 0))
+    // A normal post-1970 value (1 second after epoch) is unchanged.
+    #expect(NtpTimestamp(rawValue: epochRaw + (1 << 32)).date == Date(timeIntervalSince1970: 1))
+  }
 }
 
 // MARK: - Channel Mapping Tests
@@ -246,6 +258,15 @@ struct ChannelMappingTests {
     // Slot 1 (channel 2) still free
     #expect(mappings.nextUnassigned() == 2)
   }
+
+  /// streamIndex is an opaque SDP media index, not a channel slot, so a large
+  /// value must be accepted (finding #35 removed a bogus `< 255` guard).
+  @Test("Channel mapping accepts a large stream index")
+  func channelMappingLargeStreamIndex() throws {
+    var mappings = ChannelMappings()
+    try mappings.assign(channelId: 0, streamIndex: 300)
+    #expect(mappings.lookup(0) == ChannelMapping(streamIndex: 300, channelType: .rtp))
+  }
 }
 
 // MARK: - InorderParser Tests
@@ -257,7 +278,7 @@ struct InorderParserTests {
   /// Tests that payload_type=50 packets are silently dropped.
   @Test("Geovision PT=50 packets are skipped")
   func geovisionPT50() throws {
-    var timeline = try Timeline(start: nil, clockRate: 90_000, enforceMaxJumpSecs: nil)
+    let timeline = try Timeline(start: nil, clockRate: 90_000, enforceMaxJumpSecs: nil)
     var parser = InorderParser(
       ssrc: 0x0D25_614E, nextSeq: nil, isTcp: true, timeline: timeline)
 
@@ -297,7 +318,7 @@ struct InorderParserTests {
         localIP: "0.0.0.0", peerIP: "0.0.0.0",
         localRtpPort: 0, peerRtpPort: 0))
 
-    var timeline = try Timeline(start: nil, clockRate: 90_000, enforceMaxJumpSecs: nil)
+    let timeline = try Timeline(start: nil, clockRate: 90_000, enforceMaxJumpSecs: nil)
     var parser = InorderParser(
       ssrc: 0x0D25_614E, nextSeq: nil, isTcp: false, timeline: timeline)
 
@@ -338,7 +359,7 @@ struct InorderParserTests {
   func outOfOrderTcp() throws {
     let captured = DiagnosticBox()
 
-    var timeline = try Timeline(start: nil, clockRate: 90_000, enforceMaxJumpSecs: nil)
+    let timeline = try Timeline(start: nil, clockRate: 90_000, enforceMaxJumpSecs: nil)
     var parser = InorderParser(
       ssrc: 0x0D25_614E, nextSeq: nil, isTcp: true, timeline: timeline,
       onDiagnostic: { captured.append($0) })
@@ -366,6 +387,122 @@ struct InorderParserTests {
     #expect(captured.events.first?.message.contains("seq=1") == true)
     #expect(captured.events.first?.message.contains("expected=3") == true)
   }
+
+  /// A foreign-SSRC RTCP Sender Report under the default dropPackets policy must
+  /// be dropped BEFORE it anchors the timeline, and warn exactly once per stream.
+  @Test("Foreign-SSRC RTCP SR is dropped without corrupting the timeline (#9/#33)")
+  func foreignRtcpSRDoesNotAnchorTimeline() throws {
+    let captured = DiagnosticBox()
+    let timeline = try Timeline(start: nil, clockRate: 90_000, enforceMaxJumpSecs: nil)
+    var parser = InorderParser(
+      ssrc: 0x0D25_614E, nextSeq: nil, isTcp: true, timeline: timeline,
+      onDiagnostic: { captured.append($0) })
+
+    // Foreign SR arrives before any RTP packet: dropped, one warning, timeline
+    // untouched.
+    let sr1 = makeSenderReport(ssrc: 0xDEAD_BEEF, rtpTimestamp: 1_000_000)
+    #expect(try parser.rtcp(ctx: .dummy, streamId: 0, data: sr1) == nil)
+    #expect(captured.events.count == 1)
+    #expect(captured.events.first?.severity == .warning)
+
+    // A second foreign SR is still dropped, but no second diagnostic (latched).
+    let sr2 = makeSenderReport(ssrc: 0xDEAD_BEEF, rtpTimestamp: 2_000_000)
+    #expect(try parser.rtcp(ctx: .dummy, streamId: 0, data: sr2) == nil)
+    #expect(captured.events.count == 1)
+
+    // The next RTP packet anchors the timeline to ITS own timestamp (elapsed 0),
+    // proving the dropped foreign SR did not anchor the origin at 1_000_000.
+    let rtp = try RTPPacketBuilder(
+      sequenceNumber: 100, timestamp: 5_000_000, payloadType: 96,
+      ssrc: 0x0D25_614E, mark: true
+    ).build(payload: Data("x".utf8)).get().data
+    let recv = try parser.rtp(data: rtp, ctx: .dummy, streamId: 0, streamCtx: .dummy)
+    #expect(recv?.timestamp.elapsed == 0)
+  }
+
+  /// A malformed RTP datagram is dropped (with a single warning), never fatal —
+  /// one bad packet must not tear down the stream (finding #1).
+  @Test("Malformed RTP packet is dropped, not fatal")
+  func malformedRtpDropped() throws {
+    let captured = DiagnosticBox()
+    let timeline = try Timeline(start: nil, clockRate: 90_000, enforceMaxJumpSecs: nil)
+    var parser = InorderParser(
+      ssrc: nil, nextSeq: nil, isTcp: true, timeline: timeline,
+      onDiagnostic: { captured.append($0) })
+
+    // Fewer than 12 bytes is not a valid RTP packet -> RawRTPPacket.parse fails.
+    #expect(
+      try parser.rtp(data: Data([0x80, 0x60]), ctx: .dummy, streamId: 0, streamCtx: .dummy) == nil)
+    #expect(captured.events.count == 1)
+    #expect(captured.events.first?.severity == .warning)
+
+    // A second malformed packet drops silently (latched).
+    #expect(try parser.rtp(data: Data([0x80]), ctx: .dummy, streamId: 0, streamCtx: .dummy) == nil)
+    #expect(captured.events.count == 1)
+
+    // A subsequent valid packet still processes.
+    let good = try RTPPacketBuilder(
+      sequenceNumber: 5, timestamp: 100, payloadType: 96, ssrc: 0x1111_2222, mark: true
+    ).build(payload: Data("ok".utf8)).get().data
+    #expect(try parser.rtp(data: good, ctx: .dummy, streamId: 0, streamCtx: .dummy) != nil)
+  }
+
+  /// An RTP SSRC mismatch drops by default, throws only under .abortSession, and
+  /// is accepted under .processPackets (finding #1).
+  @Test("RTP SSRC mismatch is policy-gated")
+  func rtpSsrcMismatchPolicies() throws {
+    func makeParser(_ policy: UnknownRtcpSsrcPolicy, _ box: DiagnosticBox) throws -> InorderParser {
+      let tl = try Timeline(start: nil, clockRate: 90_000, enforceMaxJumpSecs: nil)
+      return InorderParser(
+        ssrc: 0xAAAA_AAAA, nextSeq: nil, isTcp: false, timeline: tl,
+        unknownRtcpSsrcPolicy: policy, onDiagnostic: { box.append($0) })
+    }
+    func packet(ssrc: UInt32) -> Data {
+      try! RTPPacketBuilder(
+        sequenceNumber: 1, timestamp: 1, payloadType: 96, ssrc: ssrc, mark: true
+      ).build(payload: Data("x".utf8)).get().data
+    }
+
+    // dropPackets: mismatch dropped + warned once; matching SSRC still processes.
+    let dropBox = DiagnosticBox()
+    var dropParser = try makeParser(.dropPackets, dropBox)
+    #expect(
+      try dropParser.rtp(
+        data: packet(ssrc: 0xDEAD_BEEF), ctx: .dummy, streamId: 0, streamCtx: .dummy) == nil)
+    #expect(dropBox.events.count == 1)
+    #expect(
+      try dropParser.rtp(
+        data: packet(ssrc: 0xAAAA_AAAA), ctx: .dummy, streamId: 0, streamCtx: .dummy) != nil)
+
+    // abortSession: mismatch throws.
+    var abortParser = try makeParser(.abortSession, DiagnosticBox())
+    #expect(throws: RTSPError.self) {
+      _ = try abortParser.rtp(
+        data: packet(ssrc: 0xDEAD_BEEF), ctx: .dummy, streamId: 0, streamCtx: .dummy)
+    }
+
+    // processPackets: mismatch accepted.
+    var processParser = try makeParser(.processPackets, DiagnosticBox())
+    #expect(
+      try processParser.rtp(
+        data: packet(ssrc: 0xDEAD_BEEF), ctx: .dummy, streamId: 0, streamCtx: .dummy) != nil)
+  }
+}
+
+/// Build a minimal RTCP Sender Report (PT=200, no report blocks) for tests.
+private func makeSenderReport(ssrc: UInt32, rtpTimestamp: UInt32, ntp: UInt64 = 0) -> Data {
+  func be32(_ v: UInt32) -> [UInt8] {
+    [UInt8(v >> 24), UInt8((v >> 16) & 0xFF), UInt8((v >> 8) & 0xFF), UInt8(v & 0xFF)]
+  }
+  var d = Data([0x80, 0xC8, 0x00, 0x06])  // V=2, PT=200, length=6 words => 28 bytes
+  d.append(contentsOf: be32(ssrc))
+  for shift in stride(from: 56, through: 0, by: -8) {
+    d.append(UInt8((ntp >> shift) & 0xFF))  // 8-byte NTP timestamp
+  }
+  d.append(contentsOf: be32(rtpTimestamp))
+  d.append(contentsOf: [0, 0, 0, 0])  // packet count
+  d.append(contentsOf: [0, 0, 0, 0])  // octet count
+  return d
 }
 
 /// Thread-safe collector for diagnostic events captured during a test.
