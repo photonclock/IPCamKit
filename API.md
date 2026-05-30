@@ -37,8 +37,9 @@ await session.stop()
 The main entry point. Manages the full RTSP lifecycle (DESCRIBE, SETUP, PLAY, TEARDOWN).
 While streaming it sends periodic keepalives (GET_PARAMETER when the server
 advertises support, otherwise OPTIONS) at roughly half the negotiated session
-timeout, so long-running sessions aren't dropped by the camera. Each keepalive
-round-trip is reported via `onDiagnostic` at `.info` severity.
+timeout, so long-running sessions aren't dropped by the camera. A successful
+keepalive is reported via `onDiagnostic` at `.info` severity; a failed one at
+`.warning` — the stream keeps running and the next tick retries.
 
 ```swift
 final class RTSPClientSession: Sendable
@@ -54,6 +55,10 @@ func start() async throws -> SessionDescription
 func frames() -> AsyncThrowingStream<PublicCodecItem, Error>
 func stop() async
 ```
+
+The `url` host may be a hostname, an IPv4 literal, or a bracketed IPv6 literal
+(`rtsp://[2001:db8::1]:554/stream`) — including link-local addresses with a zone
+id. Both IPv4 and IPv6 cameras work over either transport.
 
 ### RTSPDiagnostic
 
@@ -82,9 +87,11 @@ init(username: String, password: String)
 ```swift
 enum Transport: Sendable {
   case tcp   // RTP interleaved over RTSP TCP connection
-  case udp   // RTP/RTCP on separate UDP ports
+  case udp   // RTP/RTCP on a separate even/odd UDP port pair
 }
 ```
+
+Both transports work over IPv4 and IPv6 peers.
 
 ## Session Description
 
@@ -407,6 +414,17 @@ enum StreamContext: Sendable {
   case tcp(TcpStreamContext)
   case udp(UdpStreamContext)
   case dummy
+}
+
+struct TcpStreamContext: Sendable {
+  let rtpChannelId: UInt8          // RTCP channel id is one higher
+}
+
+struct UdpStreamContext: Sendable {
+  let localIP: String
+  let peerIP: String
+  let localRtpPort: UInt16         // RTCP port is one higher
+  let peerRtpPort: UInt16
 }
 
 enum PacketContext: Sendable {
