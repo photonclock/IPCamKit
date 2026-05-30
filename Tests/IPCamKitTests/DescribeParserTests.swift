@@ -859,4 +859,33 @@ struct DescribeParserTests {
     #expect(usable.audio == nil)
     #expect(usable.metadata != nil)
   }
+
+  @Test("SETUP tolerates Session timeout=0 (finding #46)")
+  func setupTimeoutZero() throws {
+    let resp = RTSPResponse(
+      statusCode: 200, reasonPhrase: "OK",
+      headers: [
+        ("Session", "12345;timeout=0"),
+        ("Transport", "RTP/AVP/TCP;unicast;interleaved=0-1"),
+      ])
+    let setup = try parseSetup(response: resp)
+    #expect(setup.session.timeoutSec == 60)  // default cadence, not aborted
+    #expect(setup.channelId == 0)
+  }
+
+  @Test("SETUP accepts single-value interleaved, rejects non-consecutive (finding #47)")
+  func setupInterleavedSingleValue() throws {
+    func setup(_ interleaved: String) throws -> SetupResponse {
+      try parseSetup(
+        response: RTSPResponse(
+          statusCode: 200, reasonPhrase: "OK",
+          headers: [
+            ("Session", "12345;timeout=60"),
+            ("Transport", "RTP/AVP/TCP;unicast;interleaved=\(interleaved)"),
+          ]))
+    }
+    #expect(try setup("0").channelId == 0)
+    #expect(try setup("2-3").channelId == 2)
+    #expect(throws: RTSPError.self) { _ = try setup("0-5") }
+  }
 }

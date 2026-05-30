@@ -334,6 +334,10 @@ actor SessionState {
   /// omits an explicit `source`.
   private var host: String?
   private var isPlaying = false
+  /// True while a `frames()` reader loop owns the connection. A second
+  /// concurrent reader would race the same socket and corrupt the RTP pipeline,
+  /// so it is rejected.
+  private var isStreaming = false
   private var onDiagnostic: (@Sendable (RTSPDiagnostic) -> Void)?
   /// Session timeout advertised by the server in the SETUP `Session` header,
   /// in seconds. Drives the keepalive interval while streaming.
@@ -344,6 +348,9 @@ actor SessionState {
   /// Control responses awaited by `sendControlRequest`, keyed by CSeq. The
   /// `streamFrames` reader resumes them as matching responses arrive.
   private var pendingResponses: [UInt32: CheckedContinuation<RTSPResponse, Error>] = [:]
+  /// Per-CSeq timeout tasks, cancelled as soon as the waiter resolves so a fast
+  /// response doesn't leave a sleeping task lingering for the full timeout.
+  private var pendingTimeouts: [UInt32: Task<Void, Never>] = [:]
   /// The periodic keepalive task, active only while streaming.
   private var keepaliveTask: Task<Void, Never>?
   /// Why the UDP control connection closed, recorded by the control reader so
@@ -749,6 +756,17 @@ actor SessionState {
       return
     }
 
+    // frames() may be consumed by only one reader at a time; a second concurrent
+    // reader would race the same connection. The check-and-set is atomic (no
+    // await between them on this actor).
+    guard !isStreaming else {
+      continuation.finish(
+        throwing: RTSPError.invalidState("frames() is already being consumed"))
+      return
+    }
+    isStreaming = true
+    defer { isStreaming = false }
+
     startKeepalive()
     defer {
       keepaliveTask?.cancel()
@@ -1095,7 +1113,7 @@ actor SessionState {
           self.resumePending(cseq, .failure(.connectionFailed("control send failed: \(error)")))
         }
       }
-      Task {
+      pendingTimeouts[cseq] = Task {
         try? await Task.sleep(for: .seconds(timeoutSeconds))
         self.resumePending(cseq, .failure(.timeout))
       }
@@ -1106,6 +1124,9 @@ actor SessionState {
   /// remove-then-resume is actor-isolated, so the reader, a send failure, and
   /// the timeout can race safely — the first to run wins, the rest no-op.
   private func resumePending(_ cseq: UInt32, _ result: Result<RTSPResponse, RTSPError>) {
+    // Cancel the (now-moot) timeout task; its only action after the sleep is a
+    // no-op resumePending, so cancelling is always safe.
+    pendingTimeouts.removeValue(forKey: cseq)?.cancel()
     guard let continuation = pendingResponses.removeValue(forKey: cseq) else { return }
     switch result {
     case .success(let response): continuation.resume(returning: response)
@@ -1116,6 +1137,8 @@ actor SessionState {
   /// Fail every outstanding control waiter (e.g. when the connection is torn
   /// down), so no `sendControlRequest` is left suspended.
   private func failAllPending(_ error: RTSPError) {
+    for task in pendingTimeouts.values { task.cancel() }
+    pendingTimeouts.removeAll()
     let waiters = pendingResponses
     pendingResponses.removeAll()
     for (_, continuation) in waiters {

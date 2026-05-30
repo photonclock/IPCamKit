@@ -14,6 +14,8 @@ public enum RTSPError: Error, Sendable, CustomStringConvertible {
   case timeout
   case invalidSDP(String)
   case depacketizationError(String)
+  /// A library API was used incorrectly (e.g. `frames()` consumed more than once).
+  case invalidState(String)
 
   public var description: String {
     switch self {
@@ -33,6 +35,8 @@ public enum RTSPError: Error, Sendable, CustomStringConvertible {
       return "Invalid SDP: \(msg)"
     case .depacketizationError(let msg):
       return "Depacketization error: \(msg)"
+    case .invalidState(let msg):
+      return "Invalid state: \(msg)"
     }
   }
 }
