@@ -52,8 +52,11 @@ struct SimpleAudioDepacketizer: Sendable {
       streamId: pkt.streamId,
       timestamp: pkt.timestamp,
       frameLength: fl,
+      // Normalize to a standalone Data (startIndex 0); the payload is a slice
+      // of the receive buffer, and handing a nonzero-startIndex slice to the
+      // public frame is a subscripting footgun for consumers.
       loss: pkt.loss,
-      data: payload
+      data: Data(payload)
     )
   }
 
