@@ -249,6 +249,48 @@ struct H265DepacketizerTests {
     #expect(p.genericParameters.pixelDimensions?.height == 1296)
   }
 
+  // Reusable valid dahua sprop trio for fmtp-tolerance tests.
+  static let dahuaVPS = "QAEMAf//AWAAAAMAsAAAAwAAAwBarAwAAAMABAAAAwAyqA=="
+  static let dahuaSPS = "QgEBAWAAAAMAsAAAAwAAAwBaoAWCAeFja5JFL83BQYFBAAADAAEAAAMADKE="
+  static let dahuaPPS = "RAHA8saNA7NA"
+
+  @Test("fmtp tolerates case-insensitive keys, valueless tokens, trailing ';' (#14/#26/#28)")
+  func tolerantFmtpParsing() throws {
+    let fmtp =
+      "profile-id=1; Sprop-VPS=\(Self.dahuaVPS); SPROP-SPS=\(Self.dahuaSPS); "
+      + "sprop-pps=\(Self.dahuaPPS); recvonly;"
+    let p = try H265Parameters.parseFormatSpecificParams(fmtp)
+    #expect(p.vpsNAL == Data(base64Encoded: Self.dahuaVPS))
+    #expect(p.spsNAL == Data(base64Encoded: Self.dahuaSPS))
+    #expect(p.ppsNAL == Data(base64Encoded: Self.dahuaPPS))
+  }
+
+  @Test("fmtp: tx-mode case-insensitive; sprop-max-don-diff>0 fails loud (#8/#28)")
+  func txModeAndDonDiff() throws {
+    let trio =
+      "sprop-vps=\(Self.dahuaVPS);sprop-sps=\(Self.dahuaSPS);sprop-pps=\(Self.dahuaPPS)"
+    _ = try H265Parameters.parseFormatSpecificParams("tx-mode=srst;\(trio)")
+    _ = try H265Parameters.parseFormatSpecificParams("sprop-max-don-diff=0;\(trio)")
+    #expect(throws: RTSPError.self) {
+      _ = try H265Parameters.parseFormatSpecificParams("sprop-max-don-diff=1;\(trio)")
+    }
+  }
+
+  @Test("fmtp: comma-separated sprop list and Annex B prefix (#27/#29)")
+  func commaListAndAnnexBPrefix() throws {
+    let vpsData = Data(base64Encoded: Self.dahuaVPS)!
+    // Comma-separated VPS list: the first entry is used.
+    let commaVps = "\(Self.dahuaVPS),QgE="
+    let p1 = try H265Parameters.parseFormatSpecificParams(
+      "sprop-vps=\(commaVps);sprop-sps=\(Self.dahuaSPS);sprop-pps=\(Self.dahuaPPS)")
+    #expect(p1.vpsNAL == vpsData)
+    // An Annex B start code prepended to the VPS is stripped.
+    let prefixed = (Data([0, 0, 0, 1]) + vpsData).base64EncodedString()
+    let p2 = try H265Parameters.parseFormatSpecificParams(
+      "sprop-vps=\(prefixed);sprop-sps=\(Self.dahuaSPS);sprop-pps=\(Self.dahuaPPS)")
+    #expect(p2.vpsNAL == vpsData)
+  }
+
   /// Short RTP payloads (zero or one byte — too short for the 2-byte H.265 NAL
   /// header) are tolerated and do not tear the stream down. Previously this
   /// surfaced as a `DepacketizeError("Short NAL")` that propagated up and
