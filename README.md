@@ -134,7 +134,7 @@ Sources/IPCamKit/
 ├── RTP/            RTP/RTCP packets, Timeline, ChannelMapping, InorderParser
 ├── Codec/          H.264/H.265 depacketizers, NAL/SPS/PPS parsing, audio + metadata depacketizers
 ├── Auth/           Basic and Digest authentication
-├── Transport/      NWConnection TCP/UDP transport
+├── Transport/      NWConnection RTSP/TCP control + bound BSD socket pair for UDP RTP/RTCP
 └── Client/         RTSP session, DESCRIBE/SETUP/PLAY parsers, Presentation
 ```
 
