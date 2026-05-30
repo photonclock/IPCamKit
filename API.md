@@ -35,6 +35,10 @@ await session.stop()
 ### RTSPClientSession
 
 The main entry point. Manages the full RTSP lifecycle (DESCRIBE, SETUP, PLAY, TEARDOWN).
+While streaming it sends periodic keepalives (GET_PARAMETER when the server
+advertises support, otherwise OPTIONS) at roughly half the negotiated session
+timeout, so long-running sessions aren't dropped by the camera. Each keepalive
+round-trip is reported via `onDiagnostic` at `.info` severity.
 
 ```swift
 final class RTSPClientSession: Sendable

@@ -103,6 +103,8 @@ See [API.md](API.md) for the full API reference.
 - SDP parsing with codec parameter extraction
 - RTP packet parsing (RFC 3550) with sequence tracking and loss detection
 - RTSP authentication (Basic and Digest with MD5)
+- Automatic session keepalive while streaming (GET_PARAMETER when the server
+  advertises it, else OPTIONS) so long sessions aren't dropped at the timeout
 - Transport: TCP interleaved and UDP
 
 ### Compatibility
