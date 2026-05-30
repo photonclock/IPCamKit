@@ -138,10 +138,19 @@ Sources/IPCamKit/
 
 ## Testing
 
-100+ tests across 15+ suites covering RTSP parsing, SDP, RTP, H.264/H.265 depacketization, AAC, simple audio, ONVIF metadata depacketization, authentication, and integration:
+120+ tests across 17 suites covering RTSP parsing, SDP, RTP, H.264/H.265 depacketization, AAC, simple audio, ONVIF metadata depacketization, authentication, and the full pipeline:
 
 ```bash
 swift test
+```
+
+The **live integration suite** drives the real `RTSPClientSession` end to end: `ffmpeg`
+publishes a synthetic H.264/H.265/AAC stream to a [mediamtx](https://github.com/bluenviron/mediamtx)
+RTSP server, and the client pulls it back over RTSP-interleaved TCP. Both tools must be on
+`PATH`:
+
+```bash
+brew install ffmpeg mediamtx
 ```
 
 ## License
