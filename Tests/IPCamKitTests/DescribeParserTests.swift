@@ -687,6 +687,19 @@ struct DescribeParserTests {
     #expect(setup.serverPort == 49152)
   }
 
+  // Test 23: anjvision — scheme-less Content-Base header
+  // The Content-Base is "192.168.1.10:554/stream0/" with no "rtsp://" prefix;
+  // it must be resolved against the request URL's scheme. Port of retina 6972ac4.
+  @Test("Anjvision scheme-less Content-Base resolves against request scheme")
+  func anjvision() throws {
+    let url = "rtsp://192.168.1.10:554/stream0"
+    let p = try loadDescribe(url: url, filename: "anjvision_describe.txt")
+    #expect(p.tool == "LIVE555 Streaming Media v2011.05.25 CHAM.LI@ANJVISION.COM")
+    #expect(p.baseURL == "rtsp://192.168.1.10:554/stream0/")
+    #expect(p.streams.count == 1)
+    #expect(p.streams[0].control == "rtsp://192.168.1.10:554/stream0/trackID=1")
+  }
+
   // MARK: - Video-less stream configurations (Axis `video=0`)
 
   @Test("Axis audio-only SDP (no video stream)")
