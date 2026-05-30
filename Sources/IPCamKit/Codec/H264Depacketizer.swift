@@ -488,8 +488,13 @@ struct H264Depacketizer: Sendable {
 
   private func canEndAU(_ nal: NALEntry) -> Bool {
     let nalType = nal.hdr.nalUnitTypeId
-    // SPS and PPS cannot end an access unit (handles Reolink quirk)
-    return nalType != 7 && nalType != 8
+    // SPS (7), PPS (8), and SEI (6) cannot end an access unit. Per H.264
+    // section 7.4.1.2.3 these non-VCL NAL units precede the primary coded
+    // picture; some cameras incorrectly set the RTP MARK bit and/or change
+    // the timestamp after them (Reolink after SPS/PPS, "H264DVR 1.0" firmware
+    // after a trailing SEI). An AU containing only these with no VCL NAL is
+    // not a valid picture. Port of retina ff771fe.
+    return nalType != 6 && nalType != 7 && nalType != 8
   }
 
   private mutating func finalizeAccessUnit(

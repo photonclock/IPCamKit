@@ -55,25 +55,25 @@ struct H264DepacketizerTests {
     try d.push(makePacket(seq: 1, timestamp: ts0, mark: false, payload: stapPayload))
     #expect(d.pull() == nil)
 
-    // Packet 3: FU-A start
+    // Packet 3: FU-A start (non-IDR slice, type 1 — SEI can no longer end an AU)
     try d.push(
       makePacket(
         seq: 2, timestamp: ts0, mark: false,
-        payload: Data([0x7C, 0x86]) + Data("fu-a start, ".utf8)))
+        payload: Data([0x7C, 0x81]) + Data("fu-a start, ".utf8)))
     #expect(d.pull() == nil)
 
     // Packet 4: FU-A middle
     try d.push(
       makePacket(
         seq: 3, timestamp: ts0, mark: false,
-        payload: Data([0x7C, 0x06]) + Data("fu-a middle, ".utf8)))
+        payload: Data([0x7C, 0x01]) + Data("fu-a middle, ".utf8)))
     #expect(d.pull() == nil)
 
     // Packet 5: FU-A end
     try d.push(
       makePacket(
         seq: 4, timestamp: ts0, mark: true,
-        payload: Data([0x7C, 0x46]) + Data("fu-a end".utf8)))
+        payload: Data([0x7C, 0x41]) + Data("fu-a end".utf8)))
 
     guard case .success(.videoFrame(let frame)) = d.pull() else {
       Issue.record("Expected video frame")
@@ -90,8 +90,8 @@ struct H264DepacketizerTests {
     // NAL 3: SEI "stap-a 2" (len=9)
     expected.append(contentsOf: [0x00, 0x00, 0x00, 0x09, 0x06])
     expected.append(Data("stap-a 2".utf8))
-    // NAL 4: FU-A reassembled (len=34=0x22, header=0x66)
-    expected.append(contentsOf: [0x00, 0x00, 0x00, 0x22, 0x66])
+    // NAL 4: FU-A reassembled (len=34=0x22, header=0x61 — non-IDR slice)
+    expected.append(contentsOf: [0x00, 0x00, 0x00, 0x22, 0x61])
     expected.append(Data("fu-a start, fu-a middle, fu-a end".utf8))
 
     #expect(frame.data == expected)
@@ -104,25 +104,25 @@ struct H264DepacketizerTests {
   func depacketizeReservedBitSet() throws {
     var d = try H264Depacketizer(clockRate: 90000, formatSpecificParams: dahuaFmtp)
 
-    // FU-A start with reserved bit (0xA6 = START=1, reserved=1, type=6)
+    // FU-A start with reserved bit (0xA1 = START=1, reserved=1, type=1 slice)
     try d.push(
       makePacket(
         seq: 2, timestamp: ts0, mark: false,
-        payload: Data([0x7C, 0xA6]) + Data("fu-a start, ".utf8)))
+        payload: Data([0x7C, 0xA1]) + Data("fu-a start, ".utf8)))
     #expect(d.pull() == nil)
 
     // FU-A middle with reserved bit
     try d.push(
       makePacket(
         seq: 3, timestamp: ts0, mark: false,
-        payload: Data([0x7C, 0x26]) + Data("fu-a middle, ".utf8)))
+        payload: Data([0x7C, 0x21]) + Data("fu-a middle, ".utf8)))
     #expect(d.pull() == nil)
 
     // FU-A end with reserved bit
     try d.push(
       makePacket(
         seq: 4, timestamp: ts0, mark: true,
-        payload: Data([0x7C, 0x66]) + Data("fu-a end".utf8)))
+        payload: Data([0x7C, 0x61]) + Data("fu-a end".utf8)))
 
     guard case .success(.videoFrame(let frame)) = d.pull() else {
       Issue.record("Expected video frame")
@@ -130,9 +130,66 @@ struct H264DepacketizerTests {
     }
 
     var expected = Data()
-    expected.append(contentsOf: [0x00, 0x00, 0x00, 0x22, 0x66])
+    expected.append(contentsOf: [0x00, 0x00, 0x00, 0x22, 0x61])
     expected.append(Data("fu-a start, fu-a middle, fu-a end".utf8))
     #expect(frame.data == expected)
+  }
+
+  /// SEI NAL with the MARK bit set must not end an access unit.
+  ///
+  /// Ports upstream `depacketize_sei_with_mark` (h264.rs). The LV-IP22IR40DVBL
+  /// camera ("H264DVR 1.0" firmware) sends SPS, PPS, and SEI as individual RTP
+  /// packets each with the MARK bit incorrectly set, all at the same timestamp
+  /// as the following IDR slice. Per H.264 section 7.4.1.2.3, these non-VCL
+  /// units precede the primary coded picture, so they must not end an AU.
+  /// See <https://github.com/scottlamb/moonfire-nvr/issues/352>.
+  @Test("SEI with MARK does not end access unit")
+  func depacketizeSEIWithMark() throws {
+    let fmtp =
+      "packetization-mode=1;profile-level-id=4d002a;sprop-parameter-sets=Z00AKpWoHgCJ+WEAAAMAAQAAAwAyhA==,aO48gA=="
+    var d = try H264Depacketizer(clockRate: 90000, formatSpecificParams: fmtp)
+
+    // SPS with (incorrect) mark.
+    let spsData = Data([
+      0x67, 0x4D, 0x00, 0x2A, 0x95, 0xA8, 0x1E, 0x00,
+      0x89, 0xF9, 0x61, 0x00, 0x00, 0x03, 0x00, 0x01,
+      0x00, 0x00, 0x03, 0x00, 0x32, 0x84,
+    ])
+    try d.push(makePacket(seq: 0, timestamp: ts0, mark: true, payload: spsData))
+    #expect(d.pull() == nil)
+
+    // PPS with (incorrect) mark.
+    let ppsData = Data([0x68, 0xEE, 0x3C, 0x80])
+    try d.push(makePacket(seq: 1, timestamp: ts0, mark: true, payload: ppsData))
+    #expect(d.pull() == nil)
+
+    // SEI (reserved payload type 229) with (incorrect) mark.
+    let seiData = Data([0x06, 0xE5, 0x01, 0xA7, 0x80])
+    try d.push(makePacket(seq: 2, timestamp: ts0, mark: true, payload: seiData))
+    #expect(d.pull() == nil)
+
+    // IDR slice with mark (correct this time) — only now does the AU close.
+    try d.push(
+      makePacket(seq: 3, timestamp: ts0, mark: true, payload: Data([0x65]) + Data("slice".utf8)))
+
+    guard case .success(.videoFrame(let frame)) = d.pull() else {
+      Issue.record("Expected one access unit containing SPS, PPS, SEI, and IDR")
+      return
+    }
+
+    var expected = Data()
+    expected.append(contentsOf: [0x00, 0x00, 0x00, 0x16])  // SPS, len 22
+    expected.append(spsData)
+    expected.append(contentsOf: [0x00, 0x00, 0x00, 0x04])  // PPS, len 4
+    expected.append(ppsData)
+    expected.append(contentsOf: [0x00, 0x00, 0x00, 0x05])  // SEI, len 5
+    expected.append(seiData)
+    expected.append(contentsOf: [0x00, 0x00, 0x00, 0x06, 0x65])  // IDR, len 6
+    expected.append(Data("slice".utf8))
+
+    #expect(frame.data == expected)
+    #expect(frame.isRandomAccessPoint)
+    #expect(d.pull() == nil)
   }
 
   /// Test 3: Reolink bad framing at start (SPS with incorrect mark bit).
@@ -440,25 +497,25 @@ struct H264DepacketizerTests {
   func emptyFragment() throws {
     var d = try H264Depacketizer(clockRate: 90000, formatSpecificParams: dahuaFmtp)
 
-    // FU-A start
+    // FU-A start (non-IDR slice, type 1 — SEI can no longer end an AU)
     try d.push(
       makePacket(
         seq: 0, timestamp: ts0, mark: false,
-        payload: Data([0x7C, 0x86]) + Data("start, ".utf8)))
+        payload: Data([0x7C, 0x81]) + Data("start, ".utf8)))
     #expect(d.pull() == nil)
 
     // FU-A middle with empty payload
     try d.push(
       makePacket(
         seq: 1, timestamp: ts0, mark: false,
-        payload: Data([0x7C, 0x06])))
+        payload: Data([0x7C, 0x01])))
     #expect(d.pull() == nil)
 
     // FU-A end
     try d.push(
       makePacket(
         seq: 2, timestamp: ts0, mark: true,
-        payload: Data([0x7C, 0x46]) + Data("end".utf8)))
+        payload: Data([0x7C, 0x41]) + Data("end".utf8)))
 
     guard case .success(.videoFrame(let frame)) = d.pull() else {
       Issue.record("Expected frame")
@@ -466,7 +523,7 @@ struct H264DepacketizerTests {
     }
 
     var expected = Data()
-    expected.append(contentsOf: [0x00, 0x00, 0x00, 0x0B, 0x66])  // len=11, header=0x66
+    expected.append(contentsOf: [0x00, 0x00, 0x00, 0x0B, 0x61])  // len=11, header=0x61
     expected.append(Data("start, end".utf8))
     #expect(frame.data == expected)
   }
@@ -635,12 +692,12 @@ struct H264DepacketizerTests {
         payload: Data([0x7C, 0x86]) + Data("fu-a start, ".utf8)))
     #expect(d.pull() == nil)
 
-    // Plain SEI with different timestamp — triggers error
+    // Plain non-IDR slice with different timestamp — triggers error
     // Upstream uses sequence_number: 0 for both packets
     try d.push(
       makePacket(
         seq: 0, timestamp: ts1, mark: true,
-        payload: Data([0x06]) + Data("plain".utf8)))
+        payload: Data([0x01]) + Data("plain".utf8)))
 
     // First pull: error about timestamp change mid-fragment
     // Upstream asserts exact error string
@@ -659,7 +716,7 @@ struct H264DepacketizerTests {
       return
     }
     var expected = Data()
-    expected.append(contentsOf: [0x00, 0x00, 0x00, 0x06, 0x06])
+    expected.append(contentsOf: [0x00, 0x00, 0x00, 0x06, 0x01])
     expected.append(Data("plain".utf8))
     #expect(frame.data == expected)
 
@@ -680,10 +737,11 @@ struct H264DepacketizerTests {
     try d.push(makePacket(seq: 0, timestamp: ts0, mark: false, payload: Data()))
     #expect(d.pull() == nil)
 
-    // A subsequent valid packet still produces a frame.
+    // A subsequent valid packet still produces a frame. Uses a non-IDR slice
+    // (type 1) since an SEI (type 6) can no longer end an access unit.
     try d.push(
       makePacket(
-        seq: 1, timestamp: ts0, mark: true, payload: Data([0x06]) + Data("plain".utf8)))
+        seq: 1, timestamp: ts0, mark: true, payload: Data([0x01]) + Data("plain".utf8)))
 
     guard case .success(.videoFrame(let frame)) = d.pull() else {
       Issue.record("Expected video frame after empty packet")
@@ -691,7 +749,7 @@ struct H264DepacketizerTests {
     }
 
     var expected = Data()
-    expected.append(contentsOf: [0x00, 0x00, 0x00, 0x06, 0x06])
+    expected.append(contentsOf: [0x00, 0x00, 0x00, 0x06, 0x01])
     expected.append(Data("plain".utf8))
     #expect(frame.data == expected)
     #expect(d.pull() == nil)
