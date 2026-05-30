@@ -12,8 +12,8 @@
 // These tests REQUIRE `ffmpeg` and `mediamtx` on `PATH` (see README "Testing").
 // They are serialized so only one server/publisher pair runs at a time.
 
-import Darwin
 import Foundation
+import Network
 import Testing
 
 @testable import IPCamKit
@@ -25,82 +25,156 @@ private struct LiveError: Error, CustomStringConvertible {
   init(_ description: String) { self.description = description }
 }
 
-// MARK: - Loopback port helpers
+// MARK: - Loopback port helpers (Network framework; IPv4 + IPv6)
 
-/// Bind a TCP socket to 127.0.0.1:`port` (use 0 for an OS-assigned ephemeral
-/// port) and return the open fd plus the bound port. The socket stays open so
-/// the caller can hold the port reserved; the caller must close the fd.
-private func bindLoopback(_ port: UInt16) -> (fd: Int32, port: UInt16)? {
-  let fd = socket(AF_INET, SOCK_STREAM, 0)
-  guard fd >= 0 else { return nil }
-  var addr = sockaddr_in()
-  addr.sin_family = sa_family_t(AF_INET)
-  addr.sin_port = port.bigEndian
-  addr.sin_addr.s_addr = inet_addr("127.0.0.1")
-  let bound = withUnsafePointer(to: &addr) { ptr in
-    ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) {
-      bind(fd, $0, socklen_t(MemoryLayout<sockaddr_in>.size))
-    }
+/// Address family for the live fixture's loopback server. Lets one fixture
+/// exercise the client over both IPv4 (`127.0.0.1`) and IPv6 (`[::1]`).
+enum LiveIPFamily: Sendable {
+  case ipv4
+  case ipv6
+
+  /// Loopback literal for client/probe connections (bare, for `NWEndpoint`).
+  var loopback: String { self == .ipv6 ? "::1" : "127.0.0.1" }
+  /// Loopback host as it appears in an RTSP URL (IPv6 is bracketed).
+  var urlHost: String { self == .ipv6 ? "[::1]" : "127.0.0.1" }
+  /// Wildcard bind host for reserving ports in this family.
+  var wildcardHost: NWEndpoint.Host {
+    self == .ipv6 ? NWEndpoint.Host("::") : NWEndpoint.Host("0.0.0.0")
   }
-  guard bound == 0 else {
-    close(fd)
-    return nil
+  /// MediaMTX listen address for `port` in this family (`[::]:P` / `:P`).
+  func mediamtxAddress(_ port: UInt16) -> String {
+    self == .ipv6 ? "[::]:\(port)" : ":\(port)"
   }
-  guard port == 0 else { return (fd, port) }
-  var name = sockaddr_in()
-  var len = socklen_t(MemoryLayout<sockaddr_in>.size)
-  let got = withUnsafeMutablePointer(to: &name) { ptr in
-    ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) {
-      getsockname(fd, $0, &len)
-    }
-  }
-  guard got == 0 else {
-    close(fd)
-    return nil
-  }
-  return (fd, UInt16(bigEndian: name.sin_port))
 }
 
-/// Reserve a free RTSP port plus a consecutive even/odd RTP/RTCP UDP pair.
-/// MediaMTX requires the RTP port to be even with RTCP = RTP + 1. All sockets
-/// are held open simultaneously so the ports are guaranteed distinct and free,
-/// then released for the child process. There is a small TOCTOU window, but the
-/// live suite is serialized and binds the ports immediately.
-func reserveServerPorts() -> (rtsp: UInt16, rtp: UInt16, rtcp: UInt16)? {
-  var held: [Int32] = []
-  defer { for fd in held { close(fd) } }
+/// Thread-safe box for handing a Network framework callback's result back to a
+/// semaphore-blocked caller. The `DispatchSemaphore` signal/wait provides the
+/// happens-before barrier; the lock guards against any spurious concurrent set.
+private final class ResultBox<T>: @unchecked Sendable {
+  private let lock = NSLock()
+  private var value: T
+  init(_ value: T) { self.value = value }
+  func set(_ newValue: T) {
+    lock.lock()
+    value = newValue
+    lock.unlock()
+  }
+  var get: T {
+    lock.lock()
+    defer { lock.unlock() }
+    return value
+  }
+}
 
-  guard let rtsp = bindLoopback(0) else { return nil }
-  held.append(rtsp.fd)
+/// Reserve a port by binding an `NWListener` (using `params`: `.tcp` or `.udp`)
+/// to `family`'s wildcard address on `port` (0 = OS-assigned ephemeral). The
+/// listener stays open so the caller holds the port reserved; the caller must
+/// cancel it. Returns the listener plus the bound port, or `nil` on failure.
+private func reserveListener(
+  _ params: NWParameters, family: LiveIPFamily, port: UInt16, queue: DispatchQueue
+) -> (listener: NWListener, port: UInt16)? {
+  params.allowLocalEndpointReuse = true
+  let portEndpoint: NWEndpoint.Port
+  if port == 0 {
+    portEndpoint = .any
+  } else if let p = NWEndpoint.Port(rawValue: port) {
+    portEndpoint = p
+  } else {
+    return nil
+  }
+  params.requiredLocalEndpoint = .hostPort(host: family.wildcardHost, port: portEndpoint)
+
+  guard let listener = try? NWListener(using: params) else { return nil }
+  let bound = ResultBox<UInt16?>(nil)
+  let sem = DispatchSemaphore(value: 0)
+  listener.newConnectionHandler = { $0.cancel() }
+  listener.stateUpdateHandler = { state in
+    switch state {
+    case .ready:
+      bound.set(listener.port?.rawValue)
+      sem.signal()
+    case .failed, .cancelled:
+      // Leaves `bound` nil so the caller treats it as a failed reservation.
+      sem.signal()
+    default:
+      break
+    }
+  }
+  listener.start(queue: queue)
+  if sem.wait(timeout: .now() + 3) == .timedOut {
+    listener.cancel()
+    return nil
+  }
+  guard let p = bound.get else {
+    listener.cancel()
+    return nil
+  }
+  return (listener, p)
+}
+
+/// Reserve a free RTSP TCP port plus a consecutive even/odd RTP/RTCP UDP pair on
+/// `family`'s wildcard address. MediaMTX requires the RTP port to be even with
+/// RTCP = RTP + 1. All listeners are held simultaneously so the ports are
+/// distinct and free, then released for the child process. There is a small
+/// TOCTOU window, but the live suite is serialized and binds the ports
+/// immediately. The UDP pair is reserved with UDP listeners (not TCP) so the
+/// ports are free in the protocol MediaMTX actually binds them in.
+func reserveServerPorts(
+  family: LiveIPFamily
+) -> (rtsp: UInt16, rtp: UInt16, rtcp: UInt16)? {
+  let queue = DispatchQueue(label: "ipcamkit.live.reserve")
+  var held: [NWListener] = []
+  defer { for listener in held { listener.cancel() } }
+
+  guard let rtsp = reserveListener(.tcp, family: family, port: 0, queue: queue) else {
+    return nil
+  }
+  held.append(rtsp.listener)
 
   for _ in 0..<400 {
-    guard let candidate = bindLoopback(0) else { continue }
+    guard let candidate = reserveListener(.udp, family: family, port: 0, queue: queue) else {
+      continue
+    }
     let base = candidate.port
-    if base % 2 == 0, base > 0, base + 1 != rtsp.port, let next = bindLoopback(base + 1) {
-      held.append(candidate.fd)
-      held.append(next.fd)
+    if base % 2 == 0, base > 0, base + 1 != rtsp.port,
+      let next = reserveListener(.udp, family: family, port: base + 1, queue: queue)
+    {
+      held.append(candidate.listener)
+      held.append(next.listener)
       return (rtsp.port, base, base + 1)
     }
-    close(candidate.fd)
+    candidate.listener.cancel()
   }
   return nil
 }
 
-/// Whether a TCP connection to 127.0.0.1:`port` succeeds right now.
-private func canConnectLoopback(_ port: UInt16) -> Bool {
-  let fd = socket(AF_INET, SOCK_STREAM, 0)
-  guard fd >= 0 else { return false }
-  defer { close(fd) }
-  var addr = sockaddr_in()
-  addr.sin_family = sa_family_t(AF_INET)
-  addr.sin_port = port.bigEndian
-  addr.sin_addr.s_addr = inet_addr("127.0.0.1")
-  let r = withUnsafePointer(to: &addr) { ptr in
-    ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) {
-      connect(fd, $0, socklen_t(MemoryLayout<sockaddr_in>.size))
+/// Whether a TCP connection to `family`'s loopback `port` succeeds right now.
+private func canConnectLoopback(family: LiveIPFamily, _ port: UInt16) -> Bool {
+  guard let nwPort = NWEndpoint.Port(rawValue: port) else { return false }
+  let queue = DispatchQueue(label: "ipcamkit.live.probe")
+  let conn = NWConnection(host: NWEndpoint.Host(family.loopback), port: nwPort, using: .tcp)
+  let connected = ResultBox(false)
+  let sem = DispatchSemaphore(value: 0)
+  conn.stateUpdateHandler = { state in
+    switch state {
+    case .ready:
+      connected.set(true)
+      sem.signal()
+    case .waiting, .failed, .cancelled:
+      // Not connectable right now. `.waiting` MUST short-circuit here: a refused
+      // connection (server not yet listening) surfaces as `.waiting` (NWConnection
+      // treats ECONNREFUSED as transient), so waiting for `.ready`/`.failed` only
+      // would burn the full 2s timeout on every pre-startup probe and blow the
+      // ~10s startup budget. The next poll iteration retries on a fresh connection.
+      sem.signal()
+    default:
+      break
     }
   }
-  return r == 0
+  conn.start(queue: queue)
+  _ = sem.wait(timeout: .now() + 2)
+  conn.cancel()
+  return connected.get
 }
 
 // MARK: - Fixture
@@ -119,6 +193,7 @@ final class LiveStreamFixture: @unchecked Sendable {
   private(set) var rtspURL = ""
 
   private let transports: [String]
+  private let family: LiveIPFamily
   private let readTimeoutSeconds: Int?
   private let ffmpegArgs: [String]
   private let marker: String
@@ -135,13 +210,17 @@ final class LiveStreamFixture: @unchecked Sendable {
   ///     so a single-element value validates exactly one RTP transport.
   ///   - ffmpegArgs: ffmpeg args between the program name and the output URL
   ///     (inputs + codec options); the `-f rtsp ... <url>` tail is appended.
+  ///   - family: loopback address family the server binds and the client/ffmpeg
+  ///     reach it over (`127.0.0.1` for IPv4, `[::1]` for IPv6).
   init(
     transports: [String],
+    family: LiveIPFamily = .ipv4,
     readTimeoutSeconds: Int? = nil,
     ffmpegArgs: [String]
   ) {
     let token = UUID().uuidString.prefix(8)
     self.transports = transports
+    self.family = family
     self.readTimeoutSeconds = readTimeoutSeconds
     self.ffmpegArgs = ffmpegArgs
     self.marker = "ipcamkit-live-\(token)"
@@ -171,10 +250,10 @@ final class LiveStreamFixture: @unchecked Sendable {
   }
 
   private func startSync() throws {
-    guard let ports = reserveServerPorts() else {
+    guard let ports = reserveServerPorts(family: family) else {
       throw LiveError("could not reserve RTSP + RTP/RTCP server ports")
     }
-    rtspURL = "rtsp://127.0.0.1:\(ports.rtsp)/\(marker)"
+    rtspURL = "rtsp://\(family.urlHost):\(ports.rtsp)/\(marker)"
 
     let readTimeoutLine = readTimeoutSeconds.map { "readTimeout: \($0)s\n" } ?? ""
     let config = """
@@ -189,9 +268,9 @@ final class LiveStreamFixture: @unchecked Sendable {
       srt: false
       rtsp: true
       rtspTransports: [\(transports.joined(separator: ", "))]
-      rtspAddress: :\(ports.rtsp)
-      rtpAddress: :\(ports.rtp)
-      rtcpAddress: :\(ports.rtcp)
+      rtspAddress: '\(family.mediamtxAddress(ports.rtsp))'
+      rtpAddress: '\(family.mediamtxAddress(ports.rtp))'
+      rtcpAddress: '\(family.mediamtxAddress(ports.rtcp))'
       paths:
         all_others:
       """
@@ -231,11 +310,11 @@ final class LiveStreamFixture: @unchecked Sendable {
     // cooperative pool.
     var opened = false
     for _ in 0..<67 {
-      if canConnectLoopback(ports.rtsp) {
+      if canConnectLoopback(family: family, ports.rtsp) {
         opened = true
         break
       }
-      usleep(150_000)
+      Thread.sleep(forTimeInterval: 0.15)
     }
     guard opened else {
       let log = (try? String(contentsOfFile: logPath, encoding: .utf8)) ?? "<no log>"
@@ -668,6 +747,84 @@ struct LiveIntegrationTests {
     let af = audioFrames(items)
     #expect(!af.isEmpty, "expected audio frames over UDP")
     #expect(af.allSatisfy { $0.sampleRate == 48000 }, "audio sample rate should be 48 kHz")
+
+    await session.stop()
+  }
+
+  // MARK: - IPv6 transport
+
+  @Test("H.264 over TCP on IPv6 (::1) yields a keyframe with SPS/PPS")
+  func h264OverTCPIPv6() async throws {
+    let watchdog = liveWatchdog(.seconds(45))
+    defer { watchdog.cancel() }
+    // MediaMTX bound on [::], pulled over rtsp://[::1]:PORT — proves the
+    // RTP-interleaved TCP path works over IPv6 end to end.
+    let fixture = LiveStreamFixture(
+      transports: ["tcp"],
+      family: .ipv6,
+      ffmpegArgs: [
+        "-re", "-f", "lavfi", "-i", "testsrc2=size=320x240:rate=15",
+        "-c:v", "libx264", "-preset", "ultrafast", "-tune", "zerolatency",
+        "-g", "15", "-pix_fmt", "yuv420p", "-an",
+      ])
+    defer { fixture.shutDown() }
+    try await fixture.start()
+
+    let (session, desc) = try await startSessionWithRetry(deadline: .seconds(20)) {
+      RTSPClientSession(url: fixture.rtspURL, transport: .tcp)
+    }
+    #expect(desc.video?.codec == .h264)
+
+    let items = await collectItems(from: session, deadline: .seconds(12)) {
+      let vf = videoFrames($0)
+      return vf.count >= 3 && vf.contains { $0.isKeyframe }
+    }
+
+    let vf = videoFrames(items)
+    #expect(!vf.isEmpty, "expected at least one video frame over IPv6 TCP")
+    #expect(vf.contains { $0.isKeyframe }, "expected a keyframe (IDR) over IPv6 TCP")
+    let spsAvailable = desc.video?.sps != nil || vf.contains { $0.sps != nil }
+    let ppsAvailable = desc.video?.pps != nil || vf.contains { $0.pps != nil }
+    #expect(spsAvailable, "expected SPS via SDP or in-band")
+    #expect(ppsAvailable, "expected PPS via SDP or in-band")
+
+    await session.stop()
+  }
+
+  @Test("H.264 over UDP on IPv6 (::1) yields a keyframe with SPS/PPS")
+  func h264OverUDPIPv6() async throws {
+    let watchdog = liveWatchdog(.seconds(45))
+    defer { watchdog.cancel() }
+    // MediaMTX bound on [::] with UDP-only RTP transport, pulled from
+    // rtsp://[::1]:PORT — proves the UDP RTP/RTCP socket pair works over IPv6.
+    let fixture = LiveStreamFixture(
+      transports: ["udp"],
+      family: .ipv6,
+      ffmpegArgs: [
+        "-re", "-f", "lavfi", "-i", "testsrc2=size=320x240:rate=15",
+        "-c:v", "libx264", "-preset", "ultrafast", "-tune", "zerolatency",
+        "-g", "15", "-pix_fmt", "yuv420p", "-an",
+      ])
+    defer { fixture.shutDown() }
+    try await fixture.start()
+
+    let (session, desc) = try await startSessionWithRetry(deadline: .seconds(20)) {
+      RTSPClientSession(url: fixture.rtspURL, transport: .udp)
+    }
+    #expect(desc.video?.codec == .h264)
+
+    let items = await collectItems(from: session, deadline: .seconds(12)) {
+      let vf = videoFrames($0)
+      return vf.count >= 3 && vf.contains { $0.isKeyframe }
+    }
+
+    let vf = videoFrames(items)
+    #expect(!vf.isEmpty, "expected at least one video frame over IPv6 UDP")
+    #expect(vf.contains { $0.isKeyframe }, "expected a keyframe (IDR) over IPv6 UDP")
+    let spsAvailable = desc.video?.sps != nil || vf.contains { $0.sps != nil }
+    let ppsAvailable = desc.video?.pps != nil || vf.contains { $0.pps != nil }
+    #expect(spsAvailable, "expected SPS via SDP or in-band")
+    #expect(ppsAvailable, "expected PPS via SDP or in-band")
 
     await session.stop()
   }
