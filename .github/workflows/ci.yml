@@ -15,6 +15,12 @@ jobs:
         with:
           submodules: false
 
+      # The live integration tests publish a synthetic stream with ffmpeg to a
+      # mediamtx RTSP server and pull it back through RTSPClientSession, so both
+      # tools must be on PATH. See README "Testing".
+      - name: Install integration test dependencies
+        run: brew install ffmpeg mediamtx
+
       - name: Build
         run: swift build -v
 
