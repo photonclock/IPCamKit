@@ -519,6 +519,17 @@ actor SessionState {
     try parsePlay(response: playResp, presentation: &presMut)
     presentation = presMut
 
+    // Surface (once) any interleaved media the camera streamed on the control
+    // channel before its PLAY response completed — those frames were dropped.
+    let droppedPrePlay = await conn.droppedInterleavedBeforeResponse
+    if droppedPrePlay > 0 {
+      onDiagnostic?(
+        RTSPDiagnostic(
+          severity: .warning,
+          message: "Dropped \(droppedPrePlay) interleaved frame(s) on the control channel "
+            + "before the PLAY response completed; camera streamed before PLAY."))
+    }
+
     // UDP NAT/firewall hole-punch: now that the server is sending (post-PLAY),
     // poke each local RTP/RTCP port toward its peer so inbound datagrams can
     // traverse a NAT. Best-effort and a no-op on loopback/LAN.
@@ -837,10 +848,20 @@ actor SessionState {
 
     // Per-stream UDP receivers feed RTP/RTCP datagrams into the event stream.
     // Each socket's DispatchSource is serial, so per-stream packet order holds.
+    let diag = onDiagnostic
     for (idx, pair) in udpPairs {
       pair.startReceiving(
         onRTP: { eventCont.yield(.rtp(streamIndex: idx, data: $0)) },
-        onRTCP: { eventCont.yield(.rtcp(streamIndex: idx, data: $0)) })
+        onRTCP: { eventCont.yield(.rtcp(streamIndex: idx, data: $0)) },
+        onError: { error in
+          // Surface the terminal receive error so a NAT'd camera whose UDP flow
+          // dies isn't a silent stall. (Control stays on TCP; keepalive/TEARDOWN
+          // still work.)
+          diag?(
+            RTSPDiagnostic(
+              severity: .warning,
+              message: "UDP receive on stream \(idx) stopped: \(error)"))
+        })
     }
 
     // The TCP connection now carries only control responses (no interleaved

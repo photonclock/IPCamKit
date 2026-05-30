@@ -346,7 +346,8 @@ final class UDPPair: @unchecked Sendable {
   /// yet connected, or if receiving already started.
   func startReceiving(
     onRTP: @escaping @Sendable (Data) -> Void,
-    onRTCP: @escaping @Sendable (Data) -> Void
+    onRTCP: @escaping @Sendable (Data) -> Void,
+    onError: (@Sendable (Error) -> Void)? = nil
   ) {
     lock.lock()
     guard !closed, !receiving, let rtpConn, let rtcpConn else {
@@ -355,8 +356,8 @@ final class UDPPair: @unchecked Sendable {
     }
     receiving = true
     lock.unlock()
-    receiveLoop(conn: rtpConn, handler: onRTP)
-    receiveLoop(conn: rtcpConn, handler: onRTCP)
+    receiveLoop(conn: rtpConn, handler: onRTP, onError: onError)
+    receiveLoop(conn: rtcpConn, handler: onRTCP, onError: onError)
   }
 
   /// Receive one datagram and re-arm. For UDP, `receiveMessage` delivers exactly
@@ -364,7 +365,10 @@ final class UDPPair: @unchecked Sendable {
   /// NOT end-of-stream — so we re-arm regardless, stopping only on a hard error
   /// or once `close()` has run. The re-arm is event-driven (one datagram → one
   /// callback), never a busy loop.
-  private func receiveLoop(conn: NWConnection, handler: @escaping @Sendable (Data) -> Void) {
+  private func receiveLoop(
+    conn: NWConnection, handler: @escaping @Sendable (Data) -> Void,
+    onError: (@Sendable (Error) -> Void)?
+  ) {
     conn.receiveMessage { [weak self] content, _, _, error in
       guard let self else { return }
       // Check `closed` before delivering so a datagram completing concurrently
@@ -376,8 +380,15 @@ final class UDPPair: @unchecked Sendable {
       if let data = content, !data.isEmpty {
         handler(data)
       }
-      guard error == nil else { return }
-      self.receiveLoop(conn: conn, handler: handler)
+      // A receive error on a connected UDP flow (e.g. an ICMP port-unreachable
+      // for a NAT'd camera) is terminal for this flow — stop re-arming (re-arming
+      // a .failed flow would busy-loop) but surface it so it isn't a silent
+      // stall.
+      guard error == nil else {
+        onError?(error!)
+        return
+      }
+      self.receiveLoop(conn: conn, handler: handler, onError: onError)
     }
   }
 

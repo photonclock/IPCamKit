@@ -31,6 +31,16 @@ actor RTSPTransportConnection {
   /// hang `connect()` forever.
   private let connectTimeoutSeconds: Double = 15
 
+  /// Grace window for a transient `.waiting` state (e.g. connection refused /
+  /// no route, which NWConnection parks in `.waiting` rather than `.failed`)
+  /// before surfacing the real error, so an unreachable camera fails fast with
+  /// its actual cause instead of burning the full connect timeout.
+  private let waitingGraceSeconds: Double = 2
+
+  /// Count of interleaved data frames dropped by `receiveResponse` while waiting
+  /// for an RTSP response (a camera that streamed media before its PLAY reply).
+  private(set) var droppedInterleavedBeforeResponse = 0
+
   /// One-shot guard so the connect continuation resumes exactly once across the
   /// state handler and the timeout. Both run on the serial `queue`, so plain
   /// access is race-free (hence `@unchecked Sendable`).
@@ -59,12 +69,23 @@ actor RTSPTransportConnection {
           guardState.settled = true
           continuation.resume(with: result)
         }
+        let grace = waitingGraceSeconds
+        let graceQueue = queue
         conn.stateUpdateHandler = { state in
           switch state {
           case .ready:
             settle(.success(()))
           case .failed(let error):
             settle(.failure(RTSPError.connectionFailed(error.localizedDescription)))
+          case .waiting(let error):
+            // NWConnection parks in .waiting for ECONNREFUSED/EHOSTUNREACH
+            // instead of going to .failed. Give it a brief grace window to
+            // self-recover, then surface the real error rather than waiting out
+            // the full connect timeout. A later .ready/.failed settles first
+            // (the one-shot guard makes this deferred settle a no-op).
+            graceQueue.asyncAfter(deadline: .now() + grace) {
+              settle(.failure(RTSPError.connectionFailed(error.localizedDescription)))
+            }
           case .cancelled:
             settle(.failure(RTSPError.unexpectedDisconnection))
           default:
@@ -153,13 +174,20 @@ actor RTSPTransportConnection {
   }
 
   /// Receive the next RTSP response, skipping interleaved data.
+  ///
+  /// Only used on the pre-PLAY request/response path (OPTIONS/DESCRIBE/SETUP/
+  /// PLAY). Per RFC 2326 the server must not stream media before the PLAY reply,
+  /// so no interleaved `.data` is expected here; any that arrives (a
+  /// non-conformant camera bursting media on the control channel before PLAY) is
+  /// dropped and counted in `droppedInterleavedBeforeResponse` for diagnostics.
   func receiveResponse() async throws -> RTSPResponse {
     while true {
       let msg = try await receiveMessage()
       if case .response(let resp) = msg {
         return resp
       }
-      // Skip interleaved data while waiting for response
+      // Interleaved data before the awaited response — drop and tally it.
+      droppedInterleavedBeforeResponse += 1
     }
   }
 
