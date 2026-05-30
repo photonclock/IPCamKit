@@ -49,11 +49,9 @@ struct ChannelMappings: Sendable {
       throw RTSPError.depacketizationError(
         "Channel ID \(channelId) must be even")
     }
-    guard streamIndex < 255 else {
-      throw RTSPError.depacketizationError(
-        "Stream index \(streamIndex) too large")
-    }
-
+    // No bound on streamIndex: it is an opaque SDP media index, not a channel
+    // slot. The 128-pair capacity is already enforced by channelId (UInt8, even)
+    // giving slotIndex = channelId/2 <= 127.
     let slotIndex = Int(channelId / 2)
 
     // Extend slots array if needed

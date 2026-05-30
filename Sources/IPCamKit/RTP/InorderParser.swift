@@ -138,8 +138,6 @@ struct InorderParser: Sendable {
     var rtpTimestamp: Timestamp?
 
     if let sr = try firstPkt.asSenderReport() {
-      rtpTimestamp = try timeline.place(sr.rtpTimestamp)
-
       let srSSRC = sr.ssrc
       if let knownSSRC = ssrc, knownSSRC != srSSRC {
         switch unknownRtcpSsrcPolicy {
@@ -148,8 +146,20 @@ struct InorderParser: Sendable {
             "Expected ssrc=\(String(format: "%08x", knownSSRC)), "
               + "got RTCP SR ssrc=\(String(format: "%08x", srSSRC))")
         case .dropPackets:
+          // Drop BEFORE touching the timeline: place() permanently anchors the
+          // timeline `start` on the first SR, so a foreign/early SR must not be
+          // allowed to corrupt the origin used by every subsequent RTP packet's
+          // NPT. Warn once per stream; further unknown-SSRC SRs drop silently.
           if !seenUnknownRtcpSession {
             seenUnknownRtcpSession = true
+            onDiagnostic?(
+              RTSPDiagnostic(
+                severity: .warning,
+                message:
+                  "RTCP Sender Report with unexpected ssrc="
+                  + "\(String(format: "%08x", srSSRC)) (expected "
+                  + "\(String(format: "%08x", knownSSRC))); dropping. Further "
+                  + "unknown-SSRC RTCP on this stream is dropped silently."))
           }
           return nil
         case .processPackets:
@@ -158,6 +168,8 @@ struct InorderParser: Sendable {
       } else if ssrc == nil && unknownRtcpSsrcPolicy != .processPackets {
         ssrc = srSSRC
       }
+      // Only anchor/advance the timeline for an SR we are actually keeping.
+      rtpTimestamp = try timeline.place(sr.rtpTimestamp)
     }
 
     seenRtcpPackets += 1
