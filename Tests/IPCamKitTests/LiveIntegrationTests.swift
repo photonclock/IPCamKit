@@ -368,6 +368,12 @@ struct LiveIntegrationTests {
     #expect(spsAvailable, "expected SPS via SDP or in-band")
     #expect(ppsAvailable, "expected PPS via SDP or in-band")
     #expect(vf.allSatisfy { !$0.nalus.isEmpty }, "every frame should carry NAL units")
+
+    // Graceful stop during active streaming must return promptly. This guards
+    // the control-channel fix: TEARDOWN is routed through the reader loop, so
+    // stop() no longer blocks until the server's session timeout (~60s). The
+    // 45s watchdog would fail this test if it regressed.
+    await session.stop()
   }
 
   @Test("H.265 over interleaved TCP yields a keyframe with in-band VPS/SPS/PPS")

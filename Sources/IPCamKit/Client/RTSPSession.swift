@@ -299,6 +299,17 @@ actor SessionState {
   private var userAgent: String?
   private var isPlaying = false
   private var onDiagnostic: (@Sendable (RTSPDiagnostic) -> Void)?
+  /// Session timeout advertised by the server in the SETUP `Session` header,
+  /// in seconds. Drives the keepalive interval while streaming.
+  private var sessionTimeoutSec: UInt32 = 60
+  /// Whether the server advertised `GET_PARAMETER` in its OPTIONS `Public`
+  /// header. When true it is preferred over `OPTIONS` as the keepalive method.
+  private var getParameterSupported = false
+  /// Control responses awaited by `sendControlRequest`, keyed by CSeq. The
+  /// `streamFrames` reader resumes them as matching responses arrive.
+  private var pendingResponses: [UInt32: CheckedContinuation<RTSPResponse, Error>] = [:]
+  /// The periodic keepalive task, active only while streaming.
+  private var keepaliveTask: Task<Void, Never>?
 
   func start(
     url: String,
@@ -340,6 +351,13 @@ actor SessionState {
     let conn = RTSPTransportConnection()
     try await conn.connect(host: host, port: port)
     connection = conn
+
+    // OPTIONS (best-effort): discover whether the server supports
+    // GET_PARAMETER, which is the preferred keepalive method. A server that
+    // rejects or omits OPTIONS just leaves us defaulting to OPTIONS keepalive.
+    if let optionsResp = try? await sendRequest(method: .options, url: url) {
+      getParameterSupported = parseOptions(response: optionsResp).getParameterSupported
+    }
 
     // DESCRIBE
     let describeResp = try await sendRequest(
@@ -674,8 +692,31 @@ actor SessionState {
       return
     }
 
-    while isPlaying {
-      let msg = try await conn.receiveMessage()
+    startKeepalive()
+    defer {
+      keepaliveTask?.cancel()
+      keepaliveTask = nil
+    }
+
+    // The reader loop owns the connection: it demultiplexes interleaved RTP/RTCP
+    // and routes RTSP responses (to keepalive/TEARDOWN) back to their waiters.
+    // It runs until the socket is closed — by stop() (clean) or by the peer.
+    while true {
+      let msg: RTSPMessage
+      do {
+        msg = try await conn.receiveMessage()
+      } catch {
+        // After stop() set isPlaying = false, the socket close is expected —
+        // end cleanly. Otherwise the peer dropped us; propagate the error.
+        if !isPlaying { break }
+        throw error
+      }
+
+      // Route control responses (keepalive / TEARDOWN) to their awaiting sender.
+      if case .response(let resp) = msg {
+        if let cseq = resp.cseq { resumePending(cseq, .success(resp)) }
+        continue
+      }
 
       guard case .data(let interleaved) = msg else { continue }
       guard let mapping = channelMappings.lookup(interleaved.channelId) else { continue }
@@ -788,13 +829,134 @@ actor SessionState {
   }
 
   func stop() async {
+    let wasPlaying = isPlaying
     isPlaying = false
-    if let _ = connection, let sid = sessionId, let url = self.url {
-      // Send TEARDOWN (best-effort) using sendRequest to include Auth and other headers
-      _ = try? await sendRequest(method: .teardown, url: url, extraHeaders: [("Session", sid)])
+    keepaliveTask?.cancel()
+    keepaliveTask = nil
+
+    if connection != nil, sessionId != nil, let url = self.url {
+      // TEARDOWN (best-effort). While playing, the reader loop owns the socket,
+      // so route the response through it — a competing read here would let the
+      // reader consume the TEARDOWN response and hang this call until the
+      // server's session timeout (~60s). Before PLAY there is no reader, so the
+      // normal request path (which reads its own response) is safe.
+      if wasPlaying {
+        _ = try? await sendControlRequest(method: .teardown, timeoutSeconds: 5)
+      } else {
+        _ = try? await sendRequest(method: .teardown, url: url)
+      }
     }
+
+    // Closing the socket unblocks the reader's pending receive (it ends cleanly
+    // because isPlaying is now false) and lets us fail any outstanding waiter.
     await connection?.close()
+    failAllPending(RTSPError.unexpectedDisconnection)
     connection = nil
+  }
+
+  // MARK: - Control channel (keepalive / TEARDOWN while streaming)
+
+  /// Send a control request on the streaming connection and await its response,
+  /// which the `streamFrames` reader loop routes back by CSeq. Used while RTP is
+  /// interleaved on the same TCP socket: the reader owns the socket, so we must
+  /// not issue a competing read here. Bounded by `timeoutSeconds`.
+  private func sendControlRequest(
+    method: RTSPMethod,
+    extraHeaders: [(String, String)] = [],
+    timeoutSeconds: Double = 10
+  ) async throws -> RTSPResponse {
+    guard let conn = connection, let url = self.url else {
+      throw RTSPError.connectionFailed("Not connected")
+    }
+    let cseq = nextCSeq()
+    var request = RTSPRequest(method: method, url: url)
+    request.setHeader("CSeq", value: "\(cseq)")
+    if let userAgent = userAgent, !userAgent.isEmpty {
+      request.setHeader("User-Agent", value: userAgent)
+    }
+    if let sid = sessionId {
+      request.setHeader("Session", value: sid)
+    }
+    if authenticator?.hasChallenge == true,
+      let authHeader = authenticator!.authorize(method: method.rawValue, uri: url)
+    {
+      request.setHeader("Authorization", value: authHeader)
+    }
+    for (name, value) in extraHeaders {
+      request.setHeader(name, value: value)
+    }
+    let data = RTSPSerializer().serialize(request)
+
+    return try await withCheckedThrowingContinuation {
+      (continuation: CheckedContinuation<RTSPResponse, any Error>) in
+      // Register the waiter BEFORE the bytes go out so the reader can never see
+      // the response before we are ready to receive it.
+      pendingResponses[cseq] = continuation
+      Task {
+        do {
+          try await conn.send(data)
+        } catch {
+          self.resumePending(cseq, .failure(.connectionFailed("control send failed: \(error)")))
+        }
+      }
+      Task {
+        try? await Task.sleep(for: .seconds(timeoutSeconds))
+        self.resumePending(cseq, .failure(.timeout))
+      }
+    }
+  }
+
+  /// Resume (exactly once) the waiter for `cseq`, if still pending. The
+  /// remove-then-resume is actor-isolated, so the reader, a send failure, and
+  /// the timeout can race safely — the first to run wins, the rest no-op.
+  private func resumePending(_ cseq: UInt32, _ result: Result<RTSPResponse, RTSPError>) {
+    guard let continuation = pendingResponses.removeValue(forKey: cseq) else { return }
+    switch result {
+    case .success(let response): continuation.resume(returning: response)
+    case .failure(let error): continuation.resume(throwing: error)
+    }
+  }
+
+  /// Fail every outstanding control waiter (e.g. when the connection is torn
+  /// down), so no `sendControlRequest` is left suspended.
+  private func failAllPending(_ error: RTSPError) {
+    let waiters = pendingResponses
+    pendingResponses.removeAll()
+    for (_, continuation) in waiters {
+      continuation.resume(throwing: error)
+    }
+  }
+
+  /// Start the periodic keepalive at roughly half the server's advertised
+  /// session timeout, preferring GET_PARAMETER when the server advertised it,
+  /// else OPTIONS. Runs until the reader loop ends or `stop()` cancels it.
+  private func startKeepalive() {
+    keepaliveTask?.cancel()
+    let period = max(1.0, Double(sessionTimeoutSec) / 2.0)
+    let method: RTSPMethod = getParameterSupported ? .getParameter : .options
+    keepaliveTask = Task { [weak self] in
+      while !Task.isCancelled {
+        try? await Task.sleep(for: .seconds(period))
+        guard !Task.isCancelled, let self else { return }
+        await self.sendKeepalive(method: method)
+      }
+    }
+  }
+
+  /// Send one keepalive request, surfacing the outcome as a diagnostic. Failures
+  /// are non-fatal — the stream keeps running and the next tick retries.
+  private func sendKeepalive(method: RTSPMethod) async {
+    guard isPlaying else { return }
+    do {
+      _ = try await sendControlRequest(method: method, timeoutSeconds: 10)
+      onDiagnostic?(
+        RTSPDiagnostic(
+          severity: .info, message: "RTSP keepalive (\(method.rawValue)) acknowledged"))
+    } catch {
+      onDiagnostic?(
+        RTSPDiagnostic(
+          severity: .warning, message: "RTSP keepalive (\(method.rawValue)) failed: \(error)"))
+    }
   }
 
   // MARK: - Private Helpers
@@ -905,6 +1067,7 @@ actor SessionState {
             + "(\(prev) -> \(setup.session.id)); rolling forward."))
     }
     sessionId = setup.session.id
+    sessionTimeoutSec = setup.session.timeoutSec
 
     let channel: UInt8
     if let server = setup.channelId, server % 2 == 0,
