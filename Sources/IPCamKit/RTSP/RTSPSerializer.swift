@@ -51,7 +51,8 @@ public struct RTSPSerializer: Sendable {
   public func serializeInterleaved(_ interleavedData: RTSPInterleavedData) -> Data {
     precondition(
       interleavedData.data.count <= 0xFFFF,
-      "interleaved frame is \(interleavedData.data.count) bytes; the 16-bit length field caps it at 65535")
+      "interleaved frame is \(interleavedData.data.count) bytes; "
+        + "the 16-bit length field caps it at 65535")
     var result = Data(capacity: 4 + interleavedData.data.count)
     result.append(0x24)  // '$'
     result.append(interleavedData.channelId)
