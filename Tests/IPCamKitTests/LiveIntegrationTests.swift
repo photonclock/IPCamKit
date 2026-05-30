@@ -3,9 +3,11 @@
 // Live end-to-end integration tests.
 //
 // `ffmpeg` publishes a synthetic stream to a `mediamtx` RTSP server, and
-// `RTSPClientSession` pulls it back over RTSP-interleaved TCP — exercising the
-// full DESCRIBE -> SETUP -> PLAY -> depacketize pipeline against a real,
-// spec-compliant server.
+// `RTSPClientSession` pulls it back — exercising the full DESCRIBE -> SETUP ->
+// PLAY -> depacketize pipeline against a real, spec-compliant server. Each test
+// runs `mediamtx` in a single RTP transport mode (TCP-interleaved OR UDP) so the
+// matching client transport is validated in isolation: a server in one mode
+// rejects a SETUP for the other, so the client cannot silently fall back.
 //
 // These tests REQUIRE `ffmpeg` and `mediamtx` on `PATH` (see README "Testing").
 // They are serialized so only one server/publisher pair runs at a time.
@@ -128,11 +130,13 @@ final class LiveStreamFixture: @unchecked Sendable {
   private var launched: [Process] = []
 
   /// - Parameters:
-  ///   - transports: value for MediaMTX `rtspTransports` (e.g. `[tcp]`).
+  ///   - transports: value for MediaMTX `rtspTransports` (e.g. `["tcp"]` or
+  ///     `["udp"]`). This gates both the ffmpeg publisher and the client reader,
+  ///     so a single-element value validates exactly one RTP transport.
   ///   - ffmpegArgs: ffmpeg args between the program name and the output URL
   ///     (inputs + codec options); the `-f rtsp ... <url>` tail is appended.
   init(
-    transports: [String] = ["tcp", "udp"],
+    transports: [String],
     readTimeoutSeconds: Int? = nil,
     ffmpegArgs: [String]
   ) {
@@ -206,11 +210,16 @@ final class LiveStreamFixture: @unchecked Sendable {
     mediamtx.standardError = logHandle ?? FileHandle.nullDevice
     mediamtx.environment = env
 
+    // `rtspTransports` gates the publisher too, not just the reader, so the
+    // ffmpeg publish leg must use a transport the server accepts. Prefer TCP
+    // when allowed (no publish-side packet loss); otherwise publish over UDP so
+    // a UDP-only server still receives the stream.
+    let publishTransport = transports.contains("tcp") ? "tcp" : "udp"
     ffmpeg.executableURL = URL(fileURLWithPath: "/usr/bin/env")
     ffmpeg.arguments =
       ["ffmpeg", "-hide_banner", "-loglevel", "error"]
       + ffmpegArgs
-      + ["-f", "rtsp", "-rtsp_transport", "tcp", rtspURL]
+      + ["-f", "rtsp", "-rtsp_transport", publishTransport, rtspURL]
     ffmpeg.standardOutput = FileHandle.nullDevice
     ffmpeg.standardError = FileHandle.nullDevice
     ffmpeg.environment = env
@@ -382,14 +391,18 @@ struct LiveIntegrationTests {
   func h264OverTCP() async throws {
     let watchdog = liveWatchdog(.seconds(45))
     defer { watchdog.cancel() }
-    let fixture = LiveStreamFixture(ffmpegArgs: [
-      "-re", "-f", "lavfi", "-i", "testsrc2=size=320x240:rate=15",
-      "-c:v", "libx264", "-preset", "ultrafast", "-tune", "zerolatency",
-      "-g", "15", "-pix_fmt", "yuv420p", "-an",
-    ])
+    let fixture = LiveStreamFixture(
+      transports: ["tcp"],
+      ffmpegArgs: [
+        "-re", "-f", "lavfi", "-i", "testsrc2=size=320x240:rate=15",
+        "-c:v", "libx264", "-preset", "ultrafast", "-tune", "zerolatency",
+        "-g", "15", "-pix_fmt", "yuv420p", "-an",
+      ])
     defer { fixture.shutDown() }
     try await fixture.start()
 
+    // MediaMTX is TCP-only here, so it rejects a UDP SETUP — the stream only
+    // works if the client genuinely used RTP-interleaved TCP.
     let (session, desc) = try await startSessionWithRetry(deadline: .seconds(20)) {
       RTSPClientSession(url: fixture.rtspURL, transport: .tcp)
     }
@@ -431,12 +444,14 @@ struct LiveIntegrationTests {
     // `no-open-gop=1` forces closed-GOP IDR keyframes (libx265 defaults to
     // open-GOP CRA, which — like retina — is not treated as a random-access
     // point). `repeat-headers=1` re-sends VPS/SPS/PPS in-band before each IDR.
-    let fixture = LiveStreamFixture(ffmpegArgs: [
-      "-re", "-f", "lavfi", "-i", "testsrc2=size=320x240:rate=15",
-      "-c:v", "libx265", "-tag:v", "hvc1", "-preset", "ultrafast",
-      "-x265-params", "keyint=15:min-keyint=15:no-open-gop=1:repeat-headers=1",
-      "-pix_fmt", "yuv420p", "-an",
-    ])
+    let fixture = LiveStreamFixture(
+      transports: ["tcp"],
+      ffmpegArgs: [
+        "-re", "-f", "lavfi", "-i", "testsrc2=size=320x240:rate=15",
+        "-c:v", "libx265", "-tag:v", "hvc1", "-preset", "ultrafast",
+        "-x265-params", "keyint=15:min-keyint=15:no-open-gop=1:repeat-headers=1",
+        "-pix_fmt", "yuv420p", "-an",
+      ])
     defer { fixture.shutDown() }
     try await fixture.start()
 
@@ -466,15 +481,17 @@ struct LiveIntegrationTests {
   func h264AacOverTCP() async throws {
     let watchdog = liveWatchdog(.seconds(45))
     defer { watchdog.cancel() }
-    let fixture = LiveStreamFixture(ffmpegArgs: [
-      "-re",
-      "-f", "lavfi", "-i", "testsrc2=size=320x240:rate=15",
-      "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=48000",
-      "-map", "0:v", "-map", "1:a",
-      "-c:v", "libx264", "-preset", "ultrafast", "-tune", "zerolatency",
-      "-g", "15", "-pix_fmt", "yuv420p",
-      "-c:a", "aac", "-ar", "48000",
-    ])
+    let fixture = LiveStreamFixture(
+      transports: ["tcp"],
+      ffmpegArgs: [
+        "-re",
+        "-f", "lavfi", "-i", "testsrc2=size=320x240:rate=15",
+        "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=48000",
+        "-map", "0:v", "-map", "1:a",
+        "-c:v", "libx264", "-preset", "ultrafast", "-tune", "zerolatency",
+        "-g", "15", "-pix_fmt", "yuv420p",
+        "-c:a", "aac", "-ar", "48000",
+      ])
     defer { fixture.shutDown() }
     try await fixture.start()
 
@@ -543,14 +560,16 @@ struct LiveIntegrationTests {
   func h264OverUDP() async throws {
     let watchdog = liveWatchdog(.seconds(45))
     defer { watchdog.cancel() }
-    // The fixture's default rtspTransports include UDP with an even/odd
-    // rtp/rtcp address pair, so the client can negotiate client_port and pull
-    // RTP/RTCP over its own UDP socket pair.
-    let fixture = LiveStreamFixture(ffmpegArgs: [
-      "-re", "-f", "lavfi", "-i", "testsrc2=size=320x240:rate=15",
-      "-c:v", "libx264", "-preset", "ultrafast", "-tune", "zerolatency",
-      "-g", "15", "-pix_fmt", "yuv420p", "-an",
-    ])
+    // MediaMTX is UDP-only here (even/odd rtp/rtcp address pair), so it rejects
+    // a TCP-interleaved SETUP. The stream only works if the client genuinely
+    // negotiated client_port and pulled RTP/RTCP over its own UDP socket pair.
+    let fixture = LiveStreamFixture(
+      transports: ["udp"],
+      ffmpegArgs: [
+        "-re", "-f", "lavfi", "-i", "testsrc2=size=320x240:rate=15",
+        "-c:v", "libx264", "-preset", "ultrafast", "-tune", "zerolatency",
+        "-g", "15", "-pix_fmt", "yuv420p", "-an",
+      ])
     defer { fixture.shutDown() }
     try await fixture.start()
 
@@ -583,12 +602,14 @@ struct LiveIntegrationTests {
   func h265OverUDP() async throws {
     let watchdog = liveWatchdog(.seconds(45))
     defer { watchdog.cancel() }
-    let fixture = LiveStreamFixture(ffmpegArgs: [
-      "-re", "-f", "lavfi", "-i", "testsrc2=size=320x240:rate=15",
-      "-c:v", "libx265", "-tag:v", "hvc1", "-preset", "ultrafast",
-      "-x265-params", "keyint=15:min-keyint=15:no-open-gop=1:repeat-headers=1",
-      "-pix_fmt", "yuv420p", "-an",
-    ])
+    let fixture = LiveStreamFixture(
+      transports: ["udp"],
+      ffmpegArgs: [
+        "-re", "-f", "lavfi", "-i", "testsrc2=size=320x240:rate=15",
+        "-c:v", "libx265", "-tag:v", "hvc1", "-preset", "ultrafast",
+        "-x265-params", "keyint=15:min-keyint=15:no-open-gop=1:repeat-headers=1",
+        "-pix_fmt", "yuv420p", "-an",
+      ])
     defer { fixture.shutDown() }
     try await fixture.start()
 
@@ -617,15 +638,17 @@ struct LiveIntegrationTests {
   func h264AacOverUDP() async throws {
     let watchdog = liveWatchdog(.seconds(45))
     defer { watchdog.cancel() }
-    let fixture = LiveStreamFixture(ffmpegArgs: [
-      "-re",
-      "-f", "lavfi", "-i", "testsrc2=size=320x240:rate=15",
-      "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=48000",
-      "-map", "0:v", "-map", "1:a",
-      "-c:v", "libx264", "-preset", "ultrafast", "-tune", "zerolatency",
-      "-g", "15", "-pix_fmt", "yuv420p",
-      "-c:a", "aac", "-ar", "48000",
-    ])
+    let fixture = LiveStreamFixture(
+      transports: ["udp"],
+      ffmpegArgs: [
+        "-re",
+        "-f", "lavfi", "-i", "testsrc2=size=320x240:rate=15",
+        "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=48000",
+        "-map", "0:v", "-map", "1:a",
+        "-c:v", "libx264", "-preset", "ultrafast", "-tune", "zerolatency",
+        "-g", "15", "-pix_fmt", "yuv420p",
+        "-c:a", "aac", "-ar", "48000",
+      ])
     defer { fixture.shutDown() }
     try await fixture.start()
 
