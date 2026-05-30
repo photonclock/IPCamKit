@@ -20,6 +20,10 @@ struct H264Depacketizer: Sendable {
   private var pieces: [Data]
   private var nals: [NALEntry]
   var seenInconsistentFuANalHdr: Bool
+  /// True once a FU-A with both the START and END bits set has been seen (a
+  /// single-fragment FU-A, forbidden by RFC 6184 section 5.8 but emitted by
+  /// some cameras). Tracked so callers can surface it as a diagnostic.
+  var seenSingleFragmentFuA: Bool
 
   init(clockRate: UInt32, formatSpecificParams: String?) throws {
     guard clockRate == 90_000 else {
@@ -31,6 +35,7 @@ struct H264Depacketizer: Sendable {
     self.pieces = []
     self.nals = []
     self.seenInconsistentFuANalHdr = false
+    self.seenSingleFragmentFuA = false
 
     if let fmtp = formatSpecificParams {
       self.parameters = try? H264Parameters.parseFormatSpecificParams(fmtp)
@@ -261,20 +266,25 @@ struct H264Depacketizer: Sendable {
       let reconstructedByte = (nalHeaderByte & 0b1110_0000) | (fuHeader & 0b0001_1111)
       let reconstructedHeader = NALHeader(reconstructedByte)
 
-      if isStart && isEnd {
-        return .failure(DepacketizeError("Invalid FU-A: both START and END set"))
-      }
+      // A FU-A with both START and END set is a single-fragment FU-A:
+      // forbidden by RFC 6184 section 5.8, but some cameras wrap small NALs
+      // this way. Tolerate it (treat as a complete NAL) instead of erroring.
+      // Port of retina 8ff7a0f / e1c0bbf.
       if !isEnd && pkt.mark {
         return .failure(DepacketizeError("FU-A with MARK but no END bit"))
       }
 
       let fuPayload = Data(payload[(payload.startIndex + 2)...])
 
+      var fuState: FuAState
       if isStart {
         if accessUnit.fuA != nil {
           return .failure(DepacketizeError("FU-A START while fragment already in progress"))
         }
-        var fuState = FuAState(
+        if isEnd && !seenSingleFragmentFuA {
+          seenSingleFragmentFuA = true
+        }
+        fuState = FuAState(
           initialNalHeader: reconstructedHeader,
           curNal: CurFuANal(hdr: reconstructedHeader, trailingZeros: 0, piecesBytes: 0))
         do {
@@ -282,9 +292,9 @@ struct H264Depacketizer: Sendable {
         } catch {
           return .failure(DepacketizeError("\(error)"))
         }
-        accessUnit.fuA = fuState
-      } else if var fuState = accessUnit.fuA {
+      } else if let inProgress = accessUnit.fuA {
         // Continuation or end
+        fuState = inProgress
         if reconstructedHeader != fuState.initialNalHeader && !seenInconsistentFuANalHdr {
           seenInconsistentFuANalHdr = true
         }
@@ -292,21 +302,6 @@ struct H264Depacketizer: Sendable {
           try addFuA(curNal: &fuState.curNal, data: fuPayload)
         } catch {
           return .failure(DepacketizeError("\(error)"))
-        }
-        if isEnd {
-          // Finalize the FU-A NAL
-          if let c = fuState.curNal {
-            let totalLen = 1 + c.piecesBytes  // header + body
-            nals.append(
-              NALEntry(
-                hdr: c.hdr,
-                nextPieceIdx: pieces.count,
-                len: totalLen))
-          }
-          fuState.curNal = nil
-          accessUnit.fuA = nil
-        } else {
-          accessUnit.fuA = fuState
         }
       } else {
         if pkt.loss > 0 {
@@ -316,6 +311,22 @@ struct H264Depacketizer: Sendable {
           return .success(())
         }
         return .failure(DepacketizeError("FU-A continuation without START"))
+      }
+
+      if isEnd {
+        // Finalize the FU-A NAL. With a single-fragment FU-A this happens on
+        // the START fragment itself.
+        if let c = fuState.curNal {
+          let totalLen = 1 + c.piecesBytes  // header + body
+          nals.append(
+            NALEntry(
+              hdr: c.hdr,
+              nextPieceIdx: pieces.count,
+              len: totalLen))
+        }
+        accessUnit.fuA = nil
+      } else {
+        accessUnit.fuA = fuState
       }
 
     case 0, 30, 31:

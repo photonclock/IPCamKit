@@ -265,6 +265,36 @@ struct H265DepacketizerTests {
     try d.push(makeH265Packet(seq: 1, timestamp: h265Ts0, mark: false, payload: Data([0x40])))
     #expect(d.pull() == nil)
   }
+
+  /// A single-fragment FU (both START and END set) carries a complete NAL.
+  ///
+  /// Ports upstream `single_fragment_fu` (h265.rs). RFC 7798 section 4.4.3
+  /// forbids this, but some cameras wrap small NALs in a one-packet FU rather
+  /// than sending them as a single NAL. Treat it as a complete NAL.
+  @Test("Single-fragment FU treated as complete NAL")
+  func singleFragmentFu() throws {
+    var d = try H265Depacketizer(clockRate: 90000, formatSpecificParams: nil)
+    #expect(d.seenSingleFragmentFu == false)
+
+    // FU packet (\x62\x01 = type 49), FU header 0xc1 (start + end + type 1 TRAIL_R).
+    try d.push(
+      makeH265Packet(
+        seq: 0, timestamp: h265Ts0, mark: true,
+        payload: Data([0x62, 0x01, 0xC1]) + Data("small nal".utf8)))
+
+    #expect(d.seenSingleFragmentFu == true)
+
+    guard case .success(.videoFrame(let frame)) = d.pull() else {
+      Issue.record("Expected video frame from single-fragment FU")
+      return
+    }
+
+    // Reconstructed NAL: type=1, layer=0, TID=1 -> header 0x02 0x01, then
+    // "small nal" (9 bytes); length = 2 (header) + 9 = 11 = 0x0b.
+    let expected: [UInt8] = [0x00, 0x00, 0x00, 0x0B, 0x02, 0x01] + Array("small nal".utf8)
+    assertDataEqual(frame.data, expected)
+    #expect(d.pull() == nil)
+  }
 }
 
 // MARK: - NAL Tests

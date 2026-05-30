@@ -754,6 +754,40 @@ struct H264DepacketizerTests {
     #expect(frame.data == expected)
     #expect(d.pull() == nil)
   }
+
+  /// A single-fragment FU-A (both START and END set) carries a complete NAL.
+  ///
+  /// Ports upstream `single_fragment_fu_a` (h264.rs). RFC 6184 section 5.8
+  /// forbids this, but some cameras wrap small NALs in a one-packet FU-A
+  /// rather than sending them as a single NAL. Treat it as a complete NAL
+  /// instead of erroring.
+  @Test("Single-fragment FU-A treated as complete NAL")
+  func singleFragmentFuA() throws {
+    var d = try H264Depacketizer(clockRate: 90000, formatSpecificParams: dahuaFmtp)
+    #expect(d.seenSingleFragmentFuA == false)
+
+    // FU-A with S=1 E=1, type=1 (non-IDR slice). FU indicator 0x7c (type 28),
+    // FU header 0xc1 (start + end + type 1).
+    try d.push(
+      makePacket(
+        seq: 0, timestamp: ts0, mark: true,
+        payload: Data([0x7C, 0xC1]) + Data("small nal".utf8)))
+
+    #expect(d.seenSingleFragmentFuA == true)
+
+    guard case .success(.videoFrame(let frame)) = d.pull() else {
+      Issue.record("Expected video frame from single-fragment FU-A")
+      return
+    }
+
+    // Reconstructed NAL header: NRI=3 (from indicator) | type=1 (from FU hdr)
+    // = 0x61, then "small nal" (9 bytes); length = 1 + 9 = 10 = 0x0a.
+    var expectedFu = Data()
+    expectedFu.append(contentsOf: [0x00, 0x00, 0x00, 0x0A, 0x61])
+    expectedFu.append(Data("small nal".utf8))
+    #expect(frame.data == expectedFu)
+    #expect(d.pull() == nil)
+  }
 }
 
 // MARK: - Test Data

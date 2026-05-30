@@ -16,6 +16,10 @@ struct H265Depacketizer: Sendable {
   private var pieces: [Data]
   private var nals: [NALEntry]
   var seenInconsistentFuNalHdr: Bool
+  /// True once a FU with both the START and END bits set has been seen (a
+  /// single-fragment FU, forbidden by RFC 7798 section 4.4.3 but emitted by
+  /// some cameras). Tracked so callers can surface it as a diagnostic.
+  var seenSingleFragmentFu: Bool
 
   init(clockRate: UInt32, formatSpecificParams: String?) throws {
     guard clockRate == 90_000 else {
@@ -27,6 +31,7 @@ struct H265Depacketizer: Sendable {
     self.pieces = []
     self.nals = []
     self.seenInconsistentFuNalHdr = false
+    self.seenSingleFragmentFu = false
 
     if let fmtp = formatSpecificParams {
       self.parameters = try? H265Parameters.parseFormatSpecificParams(fmtp)
@@ -265,31 +270,37 @@ struct H265Depacketizer: Sendable {
       }
       let reconstructedHdr = hdr.withUnitType(fuType)
 
-      if isStart && isEnd {
-        return .failure(
-          DepacketizeError(
-            "Invalid FU header \(String(format: "%02x", fuHeader))"))
-      }
+      // A FU with both START and END set is a single-fragment FU: forbidden by
+      // RFC 7798 section 4.4.3, but some cameras wrap small NALs this way.
+      // Tolerate it (treat as a complete NAL) instead of erroring. Port of
+      // retina 8ff7a0f / e1c0bbf.
       if !isEnd && pkt.mark {
         return .failure(DepacketizeError("FU pkt with MARK && !END"))
       }
 
       let fuPayload = Data(payload[(payload.startIndex + 3)...])
 
+      // `pieces` count once this fragment's payload has been appended; used to
+      // close out the NAL's piece range on the END fragment (possibly now).
+      let piecesLen: Int
       switch (isStart, accessUnit.inFU) {
       case (true, true):
         return .failure(
           DepacketizeError("FU with start bit while frag in progress"))
       case (true, false):
+        if isEnd && !seenSingleFragmentFu {
+          seenSingleFragmentFu = true
+        }
         pieces.append(fuPayload)
         nals.append(
           NALEntry(
             hdr: reconstructedHdr,
-            nextPieceIdx: Int.max,  // overwritten on end
+            nextPieceIdx: Int.max,  // overwritten on end (which may be now)
             len: 2 + fuPayload.count))
-        accessUnit.inFU = true
+        piecesLen = pieces.count
       case (false, true):
         pieces.append(fuPayload)
+        piecesLen = pieces.count
         guard var nal = nals.last else {
           return .failure(DepacketizeError("nals non-empty while in fu"))
         }
@@ -297,10 +308,6 @@ struct H265Depacketizer: Sendable {
           seenInconsistentFuNalHdr = true
         }
         nal.len += fuPayload.count
-        if isEnd {
-          nal.nextPieceIdx = pieces.count
-          accessUnit.inFU = false
-        }
         nals[nals.count - 1] = nal
       case (false, false):
         if pkt.loss > 0 {
@@ -312,6 +319,14 @@ struct H265Depacketizer: Sendable {
         return .failure(
           DepacketizeError("FU has start bit unset while no frag in progress"))
       }
+
+      if isEnd {
+        guard !nals.isEmpty else {
+          return .failure(DepacketizeError("FU end with no NAL in progress"))
+        }
+        nals[nals.count - 1].nextPieceIdx = piecesLen
+      }
+      accessUnit.inFU = !isEnd
 
     default:
       return .failure(DepacketizeError("unexpected/bad nal header type \(nalTypeRaw)"))
