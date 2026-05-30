@@ -15,6 +15,7 @@
 ### Improvements
 
 - Add visionOS 1.0 to supported platforms
+- Make the `ntpUnixEpoch` constant private. It was accidentally exposed as a public top-level symbol but is only used internally; consumers should not have relied on it.
 - Add a connect timeout to the RTSP TCP transport so an unreachable or dead camera fails fast instead of hanging.
 - Live integration test suite: drives `RTSPClientSession` end-to-end against an `ffmpeg`-published stream relayed by `mediamtx`, exercising H.264/H.265/AAC over both RTSP-interleaved TCP and UDP. CI installs `ffmpeg` and `mediamtx`.
 

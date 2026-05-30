@@ -64,7 +64,7 @@ public struct Timestamp: Sendable, Equatable, CustomStringConvertible, CustomDeb
 
 /// The Unix epoch as an NTP timestamp.
 /// NTP epoch is 1900-01-01, Unix epoch is 1970-01-01, difference is 2,208,988,800 seconds.
-public let ntpUnixEpoch = NtpTimestamp(rawValue: 2_208_988_800 << 32)
+private let ntpUnixEpoch = NtpTimestamp(rawValue: 2_208_988_800 << 32)
 
 /// A wallclock time in Network Time Protocol format.
 ///
