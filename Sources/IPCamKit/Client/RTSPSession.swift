@@ -10,8 +10,8 @@ public enum Transport: Sendable {
   /// RTP interleaved over the RTSP TCP connection.
   case tcp
   /// RTP and RTCP on a separate UDP socket pair — an even local RTP port and the
-  /// consecutive odd RTCP port — negotiated via `client_port` in SETUP. IPv4
-  /// peers only.
+  /// consecutive odd RTCP port — negotiated via `client_port` in SETUP. Works
+  /// over both IPv4 and IPv6 peers.
   case udp
 }
 
@@ -1267,10 +1267,29 @@ actor SessionState {
   /// server's `server_port` (RTCP = RTP + 1, enforced by `parseSetup`). The
   /// connected pair is recorded in `udpPairs`; on any failure its sockets are
   /// released before rethrowing.
+  ///
+  /// The local socket family (IPv4 / IPv6) is taken from the resolved control
+  /// connection so it matches the server, and the RTP/RTCP peer is chosen from a
+  /// candidate of the same family — IPv4 and IPv6 peers (including `[::1]`) both
+  /// work.
   private func setupStreamUDP(
     controlURL: String, streamIndex: Int
   ) async throws -> SetupResponse {
-    let pair = try UDPPair.bind()
+    // Pick the local socket family from the resolved control-connection peer
+    // (the same host the server's RTP/RTCP will come from). Fall back to the URL
+    // host's family, then IPv4. Resolved before SETUP since `bind()` needs it.
+    let resolved = await connection?.resolvedRemote()
+    let peerIsIPv6: Bool
+    if let resolved {
+      peerIsIPv6 = resolved.isIPv6
+    } else if let host, UDPPair.isNumericIPv6(host) {
+      peerIsIPv6 = true
+    } else {
+      peerIsIPv6 = false
+    }
+    let family: UDPAddressFamily = peerIsIPv6 ? .ipv6 : .ipv4
+
+    let pair = try await UDPPair.bind(family: family)
     do {
       let headers = [
         ("Transport", "RTP/AVP;unicast;client_port=\(pair.rtpPort)-\(pair.rtcpPort)")
@@ -1287,16 +1306,16 @@ actor SessionState {
       }
       // Choose the RTP/RTCP peer. Prefer the server-advertised `source`, then
       // the resolved control-connection peer, then the URL host — but only a
-      // value that is already a numeric IPv4 literal, since this path is
-      // IPv4-only and does not resolve hostnames. The control connection's
-      // resolved peer is always numeric, so a hostname URL (or a `source` given
-      // as a name) still works as long as the camera was reachable over TCP.
-      let resolvedPeer = await connection?.remoteIPv4()
+      // numeric literal matching the bound socket family, since this path does
+      // not resolve hostnames. The control connection's resolved peer is always
+      // a numeric literal of the right family, so it backstops a hostname URL
+      // (or a `source` given as a name / wrong family).
+      let matchesFamily = peerIsIPv6 ? UDPPair.isNumericIPv6 : UDPPair.isNumericIPv4
       let peerHost =
-        [setup.source, resolvedPeer, host]
+        [setup.source, resolved?.host, host]
         .compactMap { $0 }
-        .first(where: UDPPair.isNumericIPv4) ?? host ?? "127.0.0.1"
-      try pair.connect(peerHost: peerHost, peerRTPPort: serverRTPPort)
+        .first(where: matchesFamily) ?? resolved?.host ?? family.loopback
+      try await pair.connect(peerHost: peerHost, peerRTPPort: serverRTPPort)
 
       udpPairs[streamIndex] = pair
       return setup

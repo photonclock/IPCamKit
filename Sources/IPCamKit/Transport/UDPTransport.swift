@@ -1,168 +1,328 @@
 // Copyright (c) 2025 Steel Brain
 // SPDX-License-Identifier: MIT
-// UDP transport for RTP/RTCP using a bound BSD socket pair.
+// UDP transport for RTP/RTCP using Apple's Network framework.
 
-import Darwin
 import Foundation
+import Network
 
-/// A pair of connected UDP sockets for one RTP stream: RTP on an even local
-/// port and RTCP on the consecutive odd port (`rtpPort + 1`), as required by
-/// RFC 3550 and the `client_port=X-Y` SETUP transport parameter.
+/// Address family for a UDP RTP/RTCP socket pair, chosen to match the resolved
+/// RTSP control-connection peer so the local bind family matches the server.
+enum UDPAddressFamily: Sendable {
+  case ipv4
+  case ipv6
+
+  /// Wildcard local-bind host for this family (`0.0.0.0` / `::`).
+  var wildcardHost: NWEndpoint.Host {
+    switch self {
+    case .ipv4: return NWEndpoint.Host("0.0.0.0")
+    case .ipv6: return NWEndpoint.Host("::")
+    }
+  }
+
+  /// Loopback literal for this family, used as a last-resort peer fallback.
+  var loopback: String {
+    switch self {
+    case .ipv4: return "127.0.0.1"
+    case .ipv6: return "::1"
+    }
+  }
+}
+
+/// A pair of connected UDP flows for one RTP stream: RTP on an even local port
+/// and RTCP on the consecutive odd port (`rtpPort + 1`), as required by RFC 3550
+/// and the `client_port=X-Y` SETUP transport parameter.
 ///
-/// Unlike the RTSP control connection (TCP, via `RTSPTransportConnection`),
-/// RTP/RTCP datagrams are read with BSD sockets so the even/odd local ports can
-/// be reserved *before* SETUP and the peer connected *after* the server reports
-/// its `server_port`. Receiving is event-driven via `DispatchSource` on a
-/// private queue — never blocking a Swift Concurrency cooperative thread.
+/// Built on Apple's Network framework (`NWListener`/`NWConnection`) — the same
+/// stack the RTSP control connection (`RTSPTransportConnection`) uses — so IPv4
+/// and IPv6 peers are handled natively via `NWEndpoint`, with no `Darwin`/BSD
+/// socket calls.
 ///
-/// IPv4 only. `bind()` fails (rather than silently degrading) when no even/odd
-/// pair can be reserved, and `connect()` fails on a non-IPv4 peer.
+/// The lifecycle is what makes UDP awkward: the even/odd local ports must be
+/// reserved and advertised in SETUP *before* the server's `server_port` is known,
+/// then connected *after* it is reported. Network framework's `NWConnection`
+/// requires the remote at creation, so the local port is first reserved by an
+/// `NWListener` that stays bound across the whole SETUP round-trip. In
+/// `connect()` that listener is released and an `NWConnection` is bound to the
+/// same local port and connected to the server — a connected UDP flow, so the
+/// kernel filters inbound datagrams to the peer (preserving the symmetric-RTP
+/// assumption) and `holePunch()`/sends can omit the address.
 ///
-/// `@unchecked Sendable`: the file descriptors are immutable after `bind()`;
-/// the only mutable state (`sources`, `closed`) is guarded by `lock`.
+/// There is a microsecond window between releasing the reservation and binding
+/// the connection where the local port is unowned. It is far smaller than the
+/// SETUP round-trip (which the held listener covers), is single-host, and mirrors
+/// the TOCTOU the live-test port reservation already tolerates.
+///
+/// `@unchecked Sendable`: `rtpPort`/`rtcpPort`/`family`/`queue` are immutable
+/// after `bind()`; all other mutable state (`rtpListener`, `rtcpListener`,
+/// `rtpConn`, `rtcpConn`, `receiving`, `closed`) is guarded by `lock`. The
+/// `NWListener`/`NWConnection` callbacks all run on the private serial `queue`.
 final class UDPPair: @unchecked Sendable {
   /// The bound local RTP port (even).
   let rtpPort: UInt16
   /// The bound local RTCP port (`rtpPort + 1`, odd).
   let rtcpPort: UInt16
 
-  private let rtpFD: Int32
-  private let rtcpFD: Int32
+  private let family: UDPAddressFamily
+  /// Private serial queue for all Network framework callbacks (reservation,
+  /// connect handoff, receive loops) — never a Swift Concurrency cooperative
+  /// thread.
   private let queue: DispatchQueue
 
   private let lock = NSLock()
-  private var rtpSource: DispatchSourceRead?
-  private var rtcpSource: DispatchSourceRead?
+  /// Reservation listeners holding the local ports from `bind()` until `connect()`
+  /// hands the ports to the data connections. Nil once consumed or closed.
+  private var rtpListener: NWListener?
+  private var rtcpListener: NWListener?
+  /// Connected data flows, set by `connect()`. Nil until connected / after close.
+  private var rtpConn: NWConnection?
+  private var rtcpConn: NWConnection?
+  private var receiving = false
   private var closed = false
 
   /// Max attempts to land an even RTP port with a free consecutive odd RTCP
   /// port before giving up. Ephemeral ports are ~50/50 even/odd, so a handful
   /// of tries is overwhelmingly sufficient.
   private static let maxBindTries = 20
-  /// Receive buffer per socket. RTP bursts (and the gap between PLAY and the
-  /// reader starting) are absorbed here; a small default buffer would drop.
-  private static let receiveBufferBytes: Int32 = 4 * 1024 * 1024
-  /// Largest single datagram we will read (a UDP payload never exceeds 64 KiB).
-  private static let datagramCapacity = 65535
-  /// Datagrams drained per readiness event. The source re-fires while data
-  /// remains, so this only bounds how long one event handler runs.
-  private static let maxDrainPerEvent = 1024
+  /// How long to wait for a reservation listener to bind, or a data connection
+  /// to become ready, before treating the attempt as failed.
+  private static let reserveTimeoutSeconds: Double = 3
+  private static let connectTimeoutSeconds: Double = 10
 
-  private init(rtpFD: Int32, rtcpFD: Int32, rtpPort: UInt16, rtcpPort: UInt16) {
-    self.rtpFD = rtpFD
-    self.rtcpFD = rtcpFD
+  private init(
+    family: UDPAddressFamily, queue: DispatchQueue,
+    rtpListener: NWListener, rtcpListener: NWListener,
+    rtpPort: UInt16, rtcpPort: UInt16
+  ) {
+    self.family = family
+    self.queue = queue
+    self.rtpListener = rtpListener
+    self.rtcpListener = rtcpListener
     self.rtpPort = rtpPort
     self.rtcpPort = rtcpPort
-    self.queue = DispatchQueue(label: "ipcamkit.udp.\(rtpPort)")
+  }
+
+  /// One-shot resume guard for a `withChecked…Continuation`. All accesses occur
+  /// on the pair's serial `queue`, so the plain `Bool` is race-free.
+  private final class Settle: @unchecked Sendable {
+    private var done = false
+    func run(_ body: () -> Void) {
+      guard !done else { return }
+      done = true
+      body()
+    }
   }
 
   // MARK: - Binding
 
-  /// Reserve a local even-RTP / odd-RTCP UDP socket pair on `0.0.0.0`.
+  /// Reserve a local even-RTP / odd-RTCP UDP port pair in `family`.
   ///
-  /// Binds an ephemeral RTP socket, and if its OS-assigned port is even, binds
-  /// RTCP to `port + 1`. Retries (closing partial state) until both land or
-  /// `maxBindTries` is exhausted, then throws `transportNegotiationFailed`.
-  static func bind() throws -> UDPPair {
+  /// Each port is held by an `NWListener` bound to the wildcard address; the
+  /// listeners stay alive (holding the ports) until `connect()` releases them.
+  /// Retries until an even RTP port with a free consecutive odd RTCP port lands
+  /// or `maxBindTries` is exhausted, then throws `transportNegotiationFailed`.
+  static func bind(family: UDPAddressFamily) async throws -> UDPPair {
+    let queue = DispatchQueue(label: "ipcamkit.udp.\(family)")
     for _ in 0..<maxBindTries {
-      guard let (rtpFD, rtpPort) = Self.openBound(port: 0) else { continue }
-      // Need an even RTP port with a free consecutive odd RTCP port. (An even
-      // port is at most 65534, so `rtpPort + 1` never overflows `UInt16`.)
-      if rtpPort % 2 == 0, let (rtcpFD, _) = Self.openBound(port: rtpPort + 1) {
-        return UDPPair(
-          rtpFD: rtpFD, rtcpFD: rtcpFD, rtpPort: rtpPort, rtcpPort: rtpPort + 1)
+      guard let rtp = await reserve(family: family, requestedPort: 0, queue: queue) else {
+        continue
       }
-      Darwin.close(rtpFD)
+      // Need an even RTP port with a free consecutive odd RTCP port. (An even
+      // port is at most 65534, so `port + 1` never overflows `UInt16`.)
+      guard rtp.port % 2 == 0 else {
+        rtp.listener.cancel()
+        continue
+      }
+      if let rtcp = await reserve(family: family, requestedPort: rtp.port + 1, queue: queue) {
+        if rtcp.port == rtp.port + 1 {
+          return UDPPair(
+            family: family, queue: queue,
+            rtpListener: rtp.listener, rtcpListener: rtcp.listener,
+            rtpPort: rtp.port, rtcpPort: rtcp.port)
+        }
+        // Honored the request with the wrong port (shouldn't happen): release it.
+        rtcp.listener.cancel()
+      }
+      rtp.listener.cancel()
     }
     throw RTSPError.transportNegotiationFailed
   }
 
-  /// Open a non-blocking UDP socket bound to `0.0.0.0:port` (port 0 = ephemeral)
-  /// and return its fd plus the actual bound port, or `nil` on any failure
-  /// (e.g. the requested port is already taken). On failure the fd is closed.
-  private static func openBound(port: UInt16) -> (fd: Int32, port: UInt16)? {
-    let fd = socket(AF_INET, SOCK_DGRAM, 0)
-    guard fd >= 0 else { return nil }
+  private struct Reservation {
+    let listener: NWListener
+    let port: UInt16
+  }
 
-    var reuse: Int32 = 1
-    setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &reuse, socklen_t(MemoryLayout<Int32>.size))
-    var rcvbuf = receiveBufferBytes
-    setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &rcvbuf, socklen_t(MemoryLayout<Int32>.size))
+  /// Bind a UDP `NWListener` to the wildcard address on `requestedPort`
+  /// (0 = ephemeral), read back its bound port, and keep it alive. Returns `nil`
+  /// on any failure (e.g. the requested port is already taken); the listener is
+  /// cancelled on failure.
+  private static func reserve(
+    family: UDPAddressFamily, requestedPort: UInt16, queue: DispatchQueue
+  ) async -> Reservation? {
+    let params = NWParameters.udp
+    params.allowLocalEndpointReuse = true
+    let portEndpoint: NWEndpoint.Port
+    if requestedPort == 0 {
+      portEndpoint = .any
+    } else if let p = NWEndpoint.Port(rawValue: requestedPort) {
+      portEndpoint = p
+    } else {
+      return nil
+    }
+    params.requiredLocalEndpoint = .hostPort(host: family.wildcardHost, port: portEndpoint)
 
-    var addr = sockaddr_in()
-    addr.sin_family = sa_family_t(AF_INET)
-    addr.sin_port = port.bigEndian
-    addr.sin_addr.s_addr = INADDR_ANY
-    let bound = withUnsafePointer(to: &addr) { ptr in
-      ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) {
-        Darwin.bind(fd, $0, socklen_t(MemoryLayout<sockaddr_in>.size))
+    guard let listener = try? NWListener(using: params) else { return nil }
+
+    return await withCheckedContinuation { (cont: CheckedContinuation<Reservation?, Never>) in
+      let guardBox = Settle()
+      // UDP listeners require a new-connection handler; we never accept inbound
+      // here (the reservation only holds the port), so connections are dropped.
+      listener.newConnectionHandler = { $0.cancel() }
+      listener.stateUpdateHandler = { state in
+        switch state {
+        case .ready:
+          if let port = listener.port?.rawValue {
+            guardBox.run { cont.resume(returning: Reservation(listener: listener, port: port)) }
+          } else {
+            listener.cancel()
+            guardBox.run { cont.resume(returning: nil) }
+          }
+        case .failed:
+          listener.cancel()
+          guardBox.run { cont.resume(returning: nil) }
+        default:
+          break
+        }
+      }
+      listener.start(queue: queue)
+      queue.asyncAfter(deadline: .now() + reserveTimeoutSeconds) {
+        guardBox.run {
+          listener.cancel()
+          cont.resume(returning: nil)
+        }
       }
     }
-    guard bound == 0 else {
-      Darwin.close(fd)
-      return nil
-    }
-
-    // Read back the OS-assigned port (only meaningful for the ephemeral case).
-    var name = sockaddr_in()
-    var len = socklen_t(MemoryLayout<sockaddr_in>.size)
-    let got = withUnsafeMutablePointer(to: &name) { ptr in
-      ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) {
-        getsockname(fd, $0, &len)
-      }
-    }
-    guard got == 0 else {
-      Darwin.close(fd)
-      return nil
-    }
-
-    // Non-blocking so the readiness-event drain loop terminates on EWOULDBLOCK
-    // instead of blocking the dispatch queue.
-    let flags = fcntl(fd, F_GETFL, 0)
-    guard flags >= 0, fcntl(fd, F_SETFL, flags | O_NONBLOCK) >= 0 else {
-      Darwin.close(fd)
-      return nil
-    }
-
-    return (fd, UInt16(bigEndian: name.sin_port))
   }
 
   // MARK: - Connecting
 
-  /// Connect both sockets to the server's RTP (`peerRTPPort`) and RTCP
-  /// (`peerRTPPort + 1`) ports. Connecting filters inbound datagrams to the peer
-  /// (kernel drops spoofed/stray packets) and lets `holePunch()`/sends omit the
-  /// address. IPv4 peers only — `peerHost` must be a numeric IPv4 address.
-  func connect(peerHost: String, peerRTPPort: UInt16) throws {
+  /// Connect both flows to the server's RTP (`peerRTPPort`) and RTCP
+  /// (`peerRTPPort + 1`) ports. Releases each reservation listener and binds an
+  /// `NWConnection` to the freed local port, connected to the peer. Connecting
+  /// filters inbound datagrams to the peer (kernel drops spoofed/stray packets)
+  /// and lets `holePunch()`/sends omit the address. `peerHost` must be a numeric
+  /// literal of this pair's address family (or a name `NWEndpoint` can resolve);
+  /// IPv4 and IPv6 (including link-local zone ids) are both supported.
+  func connect(peerHost: String, peerRTPPort: UInt16) async throws {
     guard peerRTPPort < UInt16.max else {
       throw RTSPError.transportNegotiationFailed
     }
-    try Self.connectFD(rtpFD, host: peerHost, port: peerRTPPort)
-    try Self.connectFD(rtcpFD, host: peerHost, port: peerRTPPort + 1)
-  }
 
-  /// Whether `host` is already a numeric IPv4 literal (so `connect()` can use it
-  /// without a hostname resolution this IPv4-only path does not perform).
-  static func isNumericIPv4(_ host: String) -> Bool {
-    var addr = in_addr()
-    return inet_pton(AF_INET, host, &addr) == 1
-  }
-
-  private static func connectFD(_ fd: Int32, host: String, port: UInt16) throws {
-    var addr = sockaddr_in()
-    addr.sin_family = sa_family_t(AF_INET)
-    addr.sin_port = port.bigEndian
-    guard inet_pton(AF_INET, host, &addr.sin_addr) == 1 else {
-      throw RTSPError.connectionFailed(
-        "UDP transport supports IPv4 peers only; cannot use \"\(host)\"")
+    // Lock access is confined to synchronous helpers so the lock is never held
+    // across an `await` (NSLock is unavailable from async contexts).
+    guard let (rtpL, rtcpL) = listenersForConnect() else {
+      throw RTSPError.connectionFailed("UDP connect on a closed or unbound pair")
     }
-    let result = withUnsafePointer(to: &addr) { ptr in
-      ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) {
-        Darwin.connect(fd, $0, socklen_t(MemoryLayout<sockaddr_in>.size))
+
+    let rtp = try await establish(
+      listener: rtpL, localPort: rtpPort, peerHost: peerHost, peerPort: peerRTPPort)
+    let rtcp: NWConnection
+    do {
+      rtcp = try await establish(
+        listener: rtcpL, localPort: rtcpPort, peerHost: peerHost, peerPort: peerRTPPort + 1)
+    } catch {
+      rtp.cancel()
+      throw error
+    }
+
+    // A concurrent close() may have raced this connect; honor it.
+    guard storeConnections(rtp: rtp, rtcp: rtcp) else {
+      rtp.cancel()
+      rtcp.cancel()
+      throw RTSPError.connectionFailed("UDP pair closed during connect")
+    }
+  }
+
+  /// Snapshot the reservation listeners for `connect()`, or `nil` if the pair is
+  /// closed or already connected. Synchronous so it never holds the lock across
+  /// an `await`.
+  private func listenersForConnect() -> (rtp: NWListener, rtcp: NWListener)? {
+    lock.lock()
+    defer { lock.unlock() }
+    guard !closed, let rtpListener, let rtcpListener else { return nil }
+    return (rtpListener, rtcpListener)
+  }
+
+  /// Adopt the connected flows (clearing the consumed reservation listeners),
+  /// returning `false` if `close()` raced in first — in which case the caller
+  /// cancels the connections. Synchronous, for the same reason as above.
+  private func storeConnections(rtp: NWConnection, rtcp: NWConnection) -> Bool {
+    lock.lock()
+    defer { lock.unlock() }
+    guard !closed else { return false }
+    rtpConn = rtp
+    rtcpConn = rtcp
+    rtpListener = nil
+    rtcpListener = nil
+    return true
+  }
+
+  /// Release `listener` (it holds `localPort`), then bind an `NWConnection` to
+  /// that same local port and connect it to `peerHost:peerPort`. The listener is
+  /// cancelled regardless of outcome. Throws on bind/connect failure or timeout.
+  private func establish(
+    listener: NWListener, localPort: UInt16, peerHost: String, peerPort: UInt16
+  ) async throws -> NWConnection {
+    guard let nwLocalPort = NWEndpoint.Port(rawValue: localPort),
+      let nwPeerPort = NWEndpoint.Port(rawValue: peerPort)
+    else {
+      listener.cancel()
+      throw RTSPError.transportNegotiationFailed
+    }
+
+    let params = NWParameters.udp
+    params.allowLocalEndpointReuse = true
+    params.requiredLocalEndpoint = .hostPort(host: family.wildcardHost, port: nwLocalPort)
+    let conn = NWConnection(host: NWEndpoint.Host(peerHost), port: nwPeerPort, using: params)
+    let queue = self.queue
+
+    return try await withCheckedThrowingContinuation {
+      (cont: CheckedContinuation<NWConnection, Error>) in
+      let guardBox = Settle()
+      // All of these run on `queue` (serial), so `guardBox` is race-free.
+      @Sendable func settle(_ result: Result<NWConnection, Error>) {
+        guardBox.run { cont.resume(with: result) }
       }
-    }
-    guard result == 0 else {
-      throw RTSPError.connectionFailed("UDP connect to \(host):\(port) failed (errno \(errno))")
+      // Bind the data connection only once the reservation has fully released
+      // the port (the listener reaches `.cancelled`).
+      listener.stateUpdateHandler = { state in
+        guard case .cancelled = state else { return }
+        listener.stateUpdateHandler = nil
+        conn.stateUpdateHandler = { connState in
+          switch connState {
+          case .ready:
+            conn.stateUpdateHandler = nil
+            settle(.success(conn))
+          case .failed(let error):
+            conn.cancel()
+            settle(.failure(RTSPError.connectionFailed("UDP connect failed: \(error)")))
+          case .cancelled:
+            settle(.failure(RTSPError.connectionFailed("UDP connection cancelled before ready")))
+          default:
+            break
+          }
+        }
+        conn.start(queue: queue)
+      }
+      listener.cancel()
+      queue.asyncAfter(deadline: .now() + Self.connectTimeoutSeconds) {
+        // Cancel only if the timeout actually wins the race; once the connection
+        // reached `.ready` the guard is spent and the live `conn` is left alone.
+        guardBox.run {
+          conn.cancel()
+          cont.resume(with: .failure(RTSPError.timeout))
+        }
+      }
     }
   }
 
@@ -171,83 +331,93 @@ final class UDPPair: @unchecked Sendable {
   /// RTP/RTCP can return. Harmless on loopback/LAN; errors are ignored (an empty
   /// datagram is not a valid RTP/RTCP packet, so the server simply drops it).
   func holePunch() {
-    _ = Darwin.send(rtpFD, nil, 0, 0)
-    _ = Darwin.send(rtcpFD, nil, 0, 0)
+    lock.lock()
+    let conns = closed ? [] : [rtpConn, rtcpConn].compactMap { $0 }
+    lock.unlock()
+    for conn in conns {
+      conn.send(content: Data(), completion: .contentProcessed { _ in })
+    }
   }
 
   // MARK: - Receiving
 
-  /// Begin delivering datagrams: `onRTP`/`onRTCP` are invoked (on a private
-  /// serial queue) once per received datagram. No-op if already closed.
+  /// Begin delivering datagrams: `onRTP`/`onRTCP` are invoked (on the private
+  /// serial queue) once per received datagram. No-op if already closed or not
+  /// yet connected, or if receiving already started.
   func startReceiving(
     onRTP: @escaping @Sendable (Data) -> Void,
     onRTCP: @escaping @Sendable (Data) -> Void
   ) {
     lock.lock()
-    defer { lock.unlock() }
-    guard !closed, rtpSource == nil else { return }
-    rtpSource = makeReadSource(fd: rtpFD, handler: onRTP)
-    rtcpSource = makeReadSource(fd: rtcpFD, handler: onRTCP)
-    rtpSource?.resume()
-    rtcpSource?.resume()
+    guard !closed, !receiving, let rtpConn, let rtcpConn else {
+      lock.unlock()
+      return
+    }
+    receiving = true
+    lock.unlock()
+    receiveLoop(conn: rtpConn, handler: onRTP)
+    receiveLoop(conn: rtcpConn, handler: onRTCP)
   }
 
-  private func makeReadSource(
-    fd: Int32, handler: @escaping @Sendable (Data) -> Void
-  ) -> DispatchSourceRead {
-    let source = DispatchSource.makeReadSource(fileDescriptor: fd, queue: queue)
-    // One reusable receive buffer per source (the handler runs serially on the
-    // queue), freed in the cancel handler — avoids a 64 KiB allocation per
-    // readiness event under sustained RTP.
-    let buffer = UnsafeMutableRawPointer.allocate(
-      byteCount: Self.datagramCapacity, alignment: MemoryLayout<UInt8>.alignment)
-    source.setEventHandler {
-      var drained = 0
-      while drained < Self.maxDrainPerEvent {
-        let n = recv(fd, buffer, Self.datagramCapacity, 0)
-        if n > 0 {
-          handler(Data(bytes: buffer, count: n))
-          drained += 1
-        } else if n == 0 {
-          // An empty datagram (e.g. a peer's hole-punch) — already dequeued by
-          // `recv`; skip it but keep draining.
-          drained += 1
-        } else if errno == EINTR {
-          continue
-        } else {
-          // EWOULDBLOCK/EAGAIN (drained) or a real error: stop until next event.
-          break
-        }
+  /// Receive one datagram and re-arm. For UDP, `receiveMessage` delivers exactly
+  /// one datagram per call and its `isComplete` is true *per datagram* — it is
+  /// NOT end-of-stream — so we re-arm regardless, stopping only on a hard error
+  /// or once `close()` has run. The re-arm is event-driven (one datagram → one
+  /// callback), never a busy loop.
+  private func receiveLoop(conn: NWConnection, handler: @escaping @Sendable (Data) -> Void) {
+    conn.receiveMessage { [weak self] content, _, _, error in
+      guard let self else { return }
+      // Check `closed` before delivering so a datagram completing concurrently
+      // with close() is neither delivered nor re-armed.
+      self.lock.lock()
+      let stillOpen = !self.closed
+      self.lock.unlock()
+      guard stillOpen else { return }
+      if let data = content, !data.isEmpty {
+        handler(data)
       }
+      guard error == nil else { return }
+      self.receiveLoop(conn: conn, handler: handler)
     }
-    source.setCancelHandler {
-      Darwin.close(fd)
-      buffer.deallocate()
-    }
-    return source
   }
 
   // MARK: - Teardown
 
-  /// Cancel both sources (which closes the file descriptors via their cancel
-  /// handlers) and stop delivering datagrams. Idempotent.
+  /// Cancel any reservation listeners and data connections, stopping delivery.
+  /// Idempotent. Setting `closed` before cancelling stops the receive loops from
+  /// re-arming, so an in-flight receive completes and unwinds.
   func close() {
     lock.lock()
-    defer { lock.unlock() }
-    guard !closed else { return }
+    guard !closed else {
+      lock.unlock()
+      return
+    }
     closed = true
-    if let rtpSource {
-      rtpSource.cancel()
-    } else {
-      // Never started receiving: no source owns the fd, so close it directly.
-      Darwin.close(rtpFD)
+    let listeners = [rtpListener, rtcpListener].compactMap { $0 }
+    let conns = [rtpConn, rtcpConn].compactMap { $0 }
+    rtpListener = nil
+    rtcpListener = nil
+    rtpConn = nil
+    rtcpConn = nil
+    lock.unlock()
+    for listener in listeners {
+      listener.cancel()
     }
-    if let rtcpSource {
-      rtcpSource.cancel()
-    } else {
-      Darwin.close(rtcpFD)
+    for conn in conns {
+      conn.cancel()
     }
-    rtpSource = nil
-    rtcpSource = nil
+  }
+
+  // MARK: - Host classification
+
+  /// Whether `host` is a numeric IPv4 literal (no DNS/zone handling needed).
+  static func isNumericIPv4(_ host: String) -> Bool {
+    IPv4Address(host) != nil
+  }
+
+  /// Whether `host` is a numeric IPv6 literal, including link-local with a zone
+  /// id (e.g. `fe80::1%en0`), which `NWEndpoint.Host` resolves natively.
+  static func isNumericIPv6(_ host: String) -> Bool {
+    IPv6Address(host) != nil
   }
 }

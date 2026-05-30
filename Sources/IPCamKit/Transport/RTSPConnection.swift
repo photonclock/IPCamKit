@@ -182,17 +182,38 @@ actor RTSPTransportConnection {
     connectionContext ?? .dummy()
   }
 
-  /// The resolved remote IPv4 address of the control connection, if available.
-  /// Lets UDP transport target the server's RTP/RTCP ports without a second DNS
-  /// lookup when the SETUP response omits an explicit `source`. Returns `nil`
-  /// for IPv6 / unresolved endpoints.
-  func remoteIPv4() -> String? {
+  /// The resolved remote address (and family) of the control connection, if
+  /// available. Lets UDP transport pick its local socket family and target the
+  /// server's RTP/RTCP ports without a second DNS lookup when the SETUP response
+  /// omits an explicit `source`. The host is a numeric literal — a dotted IPv4
+  /// address or a bare IPv6 address (with zone id for link-local) — never
+  /// bracketed, so it can be handed straight to `NWEndpoint.Host`. Returns `nil`
+  /// for unresolved endpoints.
+  func resolvedRemote() -> ResolvedPeer? {
     guard case .hostPort(let host, _)? = connection?.currentPath?.remoteEndpoint else {
       return nil
     }
-    if case .ipv4(let addr) = host {
-      return "\(addr)"
+    switch host {
+    case .ipv4(let addr):
+      return ResolvedPeer(host: "\(addr)", isIPv6: false)
+    case .ipv6(let addr):
+      return ResolvedPeer(host: "\(addr)", isIPv6: true)
+    case .name:
+      // An unresolved hostname endpoint is not directly usable as a UDP peer
+      // (no family known); callers fall back to the URL host / source instead.
+      return nil
+    @unknown default:
+      return nil
     }
-    return nil
   }
+}
+
+/// The resolved remote peer of the control connection: a numeric host literal
+/// plus its address family. Drives the UDP transport's local socket family and
+/// RTP/RTCP peer selection.
+struct ResolvedPeer: Sendable {
+  /// Numeric IP literal (dotted IPv4 or bare IPv6, with zone id for link-local).
+  let host: String
+  /// `true` for IPv6, `false` for IPv4.
+  let isIPv6: Bool
 }
