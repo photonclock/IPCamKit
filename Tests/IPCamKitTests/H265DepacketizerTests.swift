@@ -249,6 +249,33 @@ struct H265DepacketizerTests {
     #expect(p.genericParameters.pixelDimensions?.height == 1296)
   }
 
+  /// A never-terminating FU (START once, never END/MARK, same timestamp) must
+  /// not grow memory without bound — the access-unit cap aborts it (finding #30).
+  @Test("Never-terminating FU is bounded by the access-unit cap")
+  func fuAccessUnitCap() throws {
+    var d = try H265Depacketizer(clockRate: 90000, formatSpecificParams: nil)
+    let chunk = Data(repeating: 0x42, count: 60_000)
+    // FU start: NAL header type 49 (0x62 0x01), FU header start+type-20 (0x94).
+    try d.push(
+      makeH265Packet(
+        seq: 0, timestamp: h265Ts0, mark: false,
+        payload: Data([0x62, 0x01, 0x94]) + chunk))
+    var threw = false
+    for seq in 1...500 {
+      do {
+        // FU continuation (no start/end, type 20), same timestamp, no mark.
+        try d.push(
+          makeH265Packet(
+            seq: UInt16(seq), timestamp: h265Ts0, mark: false,
+            payload: Data([0x62, 0x01, 0x14]) + chunk))
+      } catch {
+        threw = true
+        break
+      }
+    }
+    #expect(threw)
+  }
+
   // Reusable valid dahua sprop trio for fmtp-tolerance tests.
   static let dahuaVPS = "QAEMAf//AWAAAAMAsAAAAwAAAwBarAwAAAMABAAAAwAyqA=="
   static let dahuaSPS = "QgEBAWAAAAMAsAAAAwAAAwBaoAWCAeFja5JFL83BQYFBAAADAAEAAAMADKE="

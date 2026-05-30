@@ -34,6 +34,31 @@ let reolinkFmtp =
 @Suite("H.264 Depacketizer Tests")
 struct H264DepacketizerTests {
 
+  /// A never-terminating FU-A (START once, never END/MARK, same timestamp) must
+  /// not grow memory without bound — the access-unit cap aborts it (finding #7).
+  @Test("Never-terminating FU-A is bounded by the access-unit cap")
+  func fuaAccessUnitCap() throws {
+    var d = try H264Depacketizer(clockRate: 90000, formatSpecificParams: nil)
+    let chunk = Data(repeating: 0x42, count: 60_000)
+    // FU-A start: indicator type 28 (0x7C), FU header start+type-1 (0x81).
+    try d.push(
+      makePacket(seq: 0, timestamp: ts0, mark: false, payload: Data([0x7C, 0x81]) + chunk))
+    var threw = false
+    for seq in 1...500 {
+      do {
+        // FU-A continuation (no start/end, type 1), same timestamp, no mark.
+        try d.push(
+          makePacket(
+            seq: UInt16(seq), timestamp: ts0, mark: false, payload: Data([0x7C, 0x01]) + chunk))
+      } catch {
+        threw = true
+        break
+      }
+    }
+    // 16 MiB cap trips well before 500 * 60 KB (~30 MB) is buffered.
+    #expect(threw)
+  }
+
   /// Test 1: Basic depacketization with SEI + STAP-A + FU-A.
   @Test("Depacketize SEI + STAP-A + FU-A")
   func depacketize() throws {

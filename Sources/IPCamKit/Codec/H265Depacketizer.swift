@@ -20,6 +20,14 @@ struct H265Depacketizer: Sendable {
   /// single-fragment FU, forbidden by RFC 7798 section 4.4.3 but emitted by
   /// some cameras). Tracked so callers can surface it as a diagnostic.
   var seenSingleFragmentFu: Bool
+  /// Running total of buffered NAL-body bytes for the in-progress access unit,
+  /// used to bound memory against a hostile camera (see `maxAccessUnitBytes`).
+  private var pendingBytes: Int = 0
+
+  /// Cap on a single accumulated access unit. A hostile camera could otherwise
+  /// stream FU continuations (or same-timestamp NALs) forever and grow memory
+  /// without bound. 16 MiB sits well above any real 4K/8K keyframe.
+  private static let maxAccessUnitBytes = 16 << 20
 
   init(clockRate: UInt32, formatSpecificParams: String?) throws {
     guard clockRate == 90_000 else {
@@ -82,14 +90,39 @@ struct H265Depacketizer: Sendable {
 
   mutating func push(_ pkt: ReceivedRTPPacket) throws {
     let result = pushInner(pkt)
-    if case .preMark = inputState {
-    } else {
-      nals.removeAll(keepingCapacity: true)
-      pieces.removeAll(keepingCapacity: true)
-    }
     if case .failure(let err) = result {
+      // Reset to a clean state so a later push() cannot build on a buffer left
+      // partially mutated by the failed push (matters once errors are
+      // recoverable).
+      resetAccumulation()
+      inputState = .new
       throw err
     }
+    if case .preMark = inputState {
+    } else {
+      resetAccumulation()
+    }
+  }
+
+  /// Clear the in-progress access-unit buffers and the byte accumulator together,
+  /// so the running total can never drift from the actual buffered bytes.
+  private mutating func resetAccumulation() {
+    nals.removeAll(keepingCapacity: true)
+    pieces.removeAll(keepingCapacity: true)
+    pendingBytes = 0
+  }
+
+  /// Append a NAL-body piece, enforcing the per-access-unit size cap so a
+  /// never-terminating FU or a flood of NALs at one timestamp can't exhaust
+  /// memory.
+  private mutating func appendPiece(_ piece: Data) -> Result<Void, DepacketizeError> {
+    guard pendingBytes + piece.count <= Self.maxAccessUnitBytes else {
+      return .failure(
+        DepacketizeError("H.265 access unit exceeded \(Self.maxAccessUnitBytes) bytes"))
+    }
+    pieces.append(piece)
+    pendingBytes += piece.count
+    return .success(())
   }
 
   mutating func pull() -> Result<CodecItem, DepacketizeError>? {
@@ -122,8 +155,7 @@ struct H265Depacketizer: Sendable {
       au.endCtx = pkt.ctx
       let loss = pkt.loss
       if loss > 0 {
-        nals.removeAll(keepingCapacity: true)
-        pieces.removeAll(keepingCapacity: true)
+        resetAccumulation()
         if sameTimestamp(pkt.timestamp, au.timestamp) {
           if pkt.mark {
             inputState = .postMark(timestamp: au.timestamp, loss: loss)
@@ -138,16 +170,14 @@ struct H265Depacketizer: Sendable {
           let desc =
             "timestamp changed from \(au.timestamp) to \(pkt.timestamp) in the middle of a fragmented NAL"
           pending.append(.failure(DepacketizeError(desc)))
-          nals.removeAll(keepingCapacity: true)
-          pieces.removeAll(keepingCapacity: true)
+          resetAccumulation()
           accessUnit = AccessUnit.start(pkt, additionalLoss: 0, sameTsAsPrev: false)
         } else if nals.isEmpty {
           return .failure(DepacketizeError("nals should not be empty"))
         } else if canEndAU(nals.last!.hdr.unitType) {
           let frame = finalizeAccessUnit(&au)
           pending.append(frame)
-          nals.removeAll(keepingCapacity: true)
-          pieces.removeAll(keepingCapacity: true)
+          resetAccumulation()
           accessUnit = AccessUnit.start(pkt, additionalLoss: 0, sameTsAsPrev: false)
         } else {
           au.timestamp = pkt.timestamp
@@ -197,7 +227,7 @@ struct H265Depacketizer: Sendable {
       let body = Data(payload[(payload.startIndex + 2)...])
       let len = body.count + 2  // includes 2-byte header
       if !body.isEmpty {
-        pieces.append(body)
+        if case .failure(let e) = appendPiece(body) { return .failure(e) }
       }
       nals.append(NALEntry(hdr: hdr, nextPieceIdx: pieces.count, len: len))
 
@@ -246,7 +276,7 @@ struct H265Depacketizer: Sendable {
           ? Data(nalData[(nalData.startIndex + 2)...])
           : Data()
         if !innerBody.isEmpty {
-          pieces.append(innerBody)
+          if case .failure(let e) = appendPiece(innerBody) { return .failure(e) }
         }
         nals.append(
           NALEntry(
@@ -291,7 +321,7 @@ struct H265Depacketizer: Sendable {
         if isEnd && !seenSingleFragmentFu {
           seenSingleFragmentFu = true
         }
-        pieces.append(fuPayload)
+        if case .failure(let e) = appendPiece(fuPayload) { return .failure(e) }
         nals.append(
           NALEntry(
             hdr: reconstructedHdr,
@@ -299,7 +329,7 @@ struct H265Depacketizer: Sendable {
             len: 2 + fuPayload.count))
         piecesLen = pieces.count
       case (false, true):
-        pieces.append(fuPayload)
+        if case .failure(let e) = appendPiece(fuPayload) { return .failure(e) }
         piecesLen = pieces.count
         guard var nal = nals.last else {
           return .failure(DepacketizeError("nals non-empty while in fu"))
@@ -311,8 +341,7 @@ struct H265Depacketizer: Sendable {
         nals[nals.count - 1] = nal
       case (false, false):
         if pkt.loss > 0 {
-          nals.removeAll(keepingCapacity: true)
-          pieces.removeAll(keepingCapacity: true)
+          resetAccumulation()
           inputState = .loss(timestamp: accessUnit.timestamp, pkts: pkt.loss)
           return .success(())
         }
@@ -430,8 +459,7 @@ struct H265Depacketizer: Sendable {
       pieceIdx = nextPieceIdx
     }
 
-    nals.removeAll(keepingCapacity: true)
-    pieces.removeAll(keepingCapacity: true)
+    resetAccumulation()
 
     // Update parameters if changed
     let allNew = newVPS != nil && newSPS != nil && newPPS != nil

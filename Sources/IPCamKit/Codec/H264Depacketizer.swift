@@ -24,6 +24,14 @@ struct H264Depacketizer: Sendable {
   /// single-fragment FU-A, forbidden by RFC 6184 section 5.8 but emitted by
   /// some cameras). Tracked so callers can surface it as a diagnostic.
   var seenSingleFragmentFuA: Bool
+  /// Running total of buffered NAL-body bytes for the in-progress access unit,
+  /// used to bound memory against a hostile camera (see `maxAccessUnitBytes`).
+  private var pendingBytes: Int = 0
+
+  /// Cap on a single accumulated access unit. A hostile camera could otherwise
+  /// stream FU-A continuations (or same-timestamp NALs) forever and grow memory
+  /// without bound. 16 MiB sits well above any real 4K/8K keyframe.
+  private static let maxAccessUnitBytes = 16 << 20
 
   init(clockRate: UInt32, formatSpecificParams: String?) throws {
     guard clockRate == 90_000 else {
@@ -96,15 +104,39 @@ struct H264Depacketizer: Sendable {
 
   mutating func push(_ pkt: ReceivedRTPPacket) throws {
     let result = pushInner(pkt)
-    // Clear nals and pieces if not in preMark state
-    if case .preMark = inputState {
-    } else {
-      nals.removeAll(keepingCapacity: true)
-      pieces.removeAll(keepingCapacity: true)
-    }
     if case .failure(let err) = result {
+      // A failure may have left nals/pieces partially mutated while inputState
+      // is still .preMark; reset to a clean state so a later push() cannot build
+      // on a corrupted buffer (matters once depacketizer errors are recoverable).
+      resetAccumulation()
+      inputState = .new
       throw err
     }
+    // Success: keep the in-progress NAL buffers only while mid-AU (.preMark).
+    if case .preMark = inputState {
+    } else {
+      resetAccumulation()
+    }
+  }
+
+  /// Clear the in-progress access-unit buffers and the byte accumulator together,
+  /// so the running total can never drift from the actual buffered bytes.
+  private mutating func resetAccumulation() {
+    nals.removeAll(keepingCapacity: true)
+    pieces.removeAll(keepingCapacity: true)
+    pendingBytes = 0
+  }
+
+  /// Append a NAL-body piece, enforcing the per-access-unit size cap. Throws when
+  /// the cap would be exceeded so a never-terminating FU-A or a flood of NALs at
+  /// one timestamp can't exhaust memory.
+  private mutating func appendPiece(_ piece: Data) throws {
+    guard pendingBytes + piece.count <= Self.maxAccessUnitBytes else {
+      throw DepacketizeError(
+        "H.264 access unit exceeded \(Self.maxAccessUnitBytes) bytes")
+    }
+    pieces.append(piece)
+    pendingBytes += piece.count
   }
 
   mutating func pull() -> Result<CodecItem, DepacketizeError>? {
@@ -138,8 +170,7 @@ struct H264Depacketizer: Sendable {
       au.endCtx = pkt.ctx
       let loss = pkt.loss
       if loss > 0 {
-        nals.removeAll(keepingCapacity: true)
-        pieces.removeAll(keepingCapacity: true)
+        resetAccumulation()
         if sameTimestamp(pkt.timestamp, au.timestamp) {
           if pkt.mark {
             inputState = .postMark(timestamp: au.timestamp, loss: loss)
@@ -157,15 +188,13 @@ struct H264Depacketizer: Sendable {
           let desc =
             "timestamp changed from \(au.timestamp) to \(pkt.timestamp) in the middle of a fragmented NAL"
           pending.append(.failure(DepacketizeError(desc)))
-          nals.removeAll(keepingCapacity: true)
-          pieces.removeAll(keepingCapacity: true)
+          resetAccumulation()
           accessUnit = AccessUnit.start(pkt, additionalLoss: 0, sameTsAsPrev: false)
         } else if !nals.isEmpty && canEndAU(nals.last!) {
           // Normal AU boundary
           let frame = finalizeAccessUnit(&au)
           pending.append(frame)
-          nals.removeAll(keepingCapacity: true)
-          pieces.removeAll(keepingCapacity: true)
+          resetAccumulation()
           accessUnit = AccessUnit.start(pkt, additionalLoss: 0, sameTsAsPrev: false)
         } else if nals.isEmpty {
           au.timestamp = pkt.timestamp
@@ -306,8 +335,7 @@ struct H264Depacketizer: Sendable {
       } else {
         if pkt.loss > 0 {
           inputState = .loss(timestamp: accessUnit.timestamp, pkts: pkt.loss)
-          nals.removeAll(keepingCapacity: true)
-          pieces.removeAll(keepingCapacity: true)
+          resetAccumulation()
           return .success(())
         }
         return .failure(DepacketizeError("FU-A continuation without START"))
@@ -369,7 +397,7 @@ struct H264Depacketizer: Sendable {
     }
     let body = data.count > 1 ? Data(data[(data.startIndex + 1)...]) : Data()
     if !body.isEmpty {
-      pieces.append(body)
+      do { try appendPiece(body) } catch { return .failure(DepacketizeError("\(error)")) }
     }
     nals.append(
       NALEntry(
@@ -426,8 +454,8 @@ struct H264Depacketizer: Sendable {
           let pieceEnd = dataEnd - c.trailingZeros - 1
           if pieceEnd > dataOffset {
             let piece = Data(bytes[dataOffset..<pieceEnd])
+            try appendPiece(piece)
             c.piecesBytes += piece.count
-            pieces.append(piece)
           }
           // Finalize current NAL
           nals.append(
@@ -448,8 +476,8 @@ struct H264Depacketizer: Sendable {
           if curPos - dataOffset < c.trailingZeros {
             // Some zeros came from previous fragment — insert synthetic zeros
             let prevChunkZeros = c.trailingZeros - (curPos - dataOffset)
+            try appendPiece(Data(repeating: 0, count: prevChunkZeros))
             c.piecesBytes += prevChunkZeros
-            pieces.append(Data(repeating: 0, count: prevChunkZeros))
           }
           c.trailingZeros = 0
           curPos += 1
@@ -460,39 +488,12 @@ struct H264Depacketizer: Sendable {
       let nonTrailingEnd = bytes.count - c.trailingZeros
       if nonTrailingEnd > dataOffset {
         let piece = Data(bytes[dataOffset..<nonTrailingEnd])
+        try appendPiece(piece)
         c.piecesBytes += piece.count
-        pieces.append(piece)
       }
       curNal = c
       return
     }
-  }
-
-  // MARK: - Diagnostics
-
-  /// Validate NAL ordering per H.264 section 7.4.1.2.3 (diagnostic only).
-  /// Ports upstream `validate_order` from h264.rs lines 816-854.
-  private func validateOrder(_ nals: [NALEntry]) -> String {
-    var errs = ""
-    var seenVCL = false
-    for (i, nal) in nals.enumerated() {
-      switch nal.hdr.nalUnitTypeId {
-      case 1, 2, 3, 4, 5:
-        seenVCL = true
-      case 6:  // SEI
-        if seenVCL { errs += "\n* SEI after VCL" }
-      case 9:  // Access Unit Delimiter
-        if i != 0 { errs += "\n* access unit delimiter must be first in AU" }
-      case 10:  // End of Sequence
-        if !seenVCL { errs += "\n* end of sequence without VCL" }
-      case 11:  // End of Stream
-        if i != nals.count - 1 { errs += "\n* end of stream NAL isn't last" }
-      default:
-        break
-      }
-    }
-    if !seenVCL { errs += "\n* missing VCL" }
-    return errs
   }
 
   // MARK: - Access Unit Finalization
