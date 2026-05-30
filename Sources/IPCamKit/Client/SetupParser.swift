@@ -73,7 +73,7 @@ func parseSetup(response: RTSPResponse) throws -> SetupResponse {
       guard channels.count == 2,
         let first = UInt8(channels[0].trimmingCharacters(in: .whitespaces)),
         let second = UInt8(channels[1].trimmingCharacters(in: .whitespaces)),
-        second == first + 1
+        Int(second) == Int(first) + 1
       else {
         throw RTSPError.sessionSetupFailed(
           statusCode: Int(response.statusCode),
@@ -88,7 +88,7 @@ func parseSetup(response: RTSPResponse) throws -> SetupResponse {
       guard ports.count == 2,
         let first = UInt16(ports[0].trimmingCharacters(in: .whitespaces)),
         let second = UInt16(ports[1].trimmingCharacters(in: .whitespaces)),
-        second == first + 1
+        Int(second) == Int(first) + 1
       else {
         throw RTSPError.sessionSetupFailed(
           statusCode: Int(response.statusCode),

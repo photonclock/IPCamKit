@@ -106,17 +106,25 @@ public struct RTSPParser: Sendable {
       }
     }
 
-    // Determine body length from Content-Length header
+    // Determine body length from Content-Length header. The value is
+    // attacker-controlled, so reject negatives outright.
     var bodyLength = 0
     let contentLengthKey = headers.first(where: { $0.0.lowercased() == "content-length" })
-    if let cl = contentLengthKey, let len = Int(cl.1.trimmingCharacters(in: .whitespaces)) {
+    if let cl = contentLengthKey {
+      guard let len = Int(cl.1.trimmingCharacters(in: .whitespaces)), len >= 0 else {
+        throw RTSPError.depacketizationError("Invalid Content-Length: \(cl.1)")
+      }
       bodyLength = len
     }
 
-    let totalLength = headerEnd - buffer.startIndex + bodyLength
-    guard buffer.count >= totalLength else {
+    let headerBytes = headerEnd - buffer.startIndex
+    // If the body hasn't fully arrived, wait for more data. Comparing against
+    // the bytes remaining (rather than computing `headerBytes + bodyLength`
+    // first) keeps an absurd Content-Length such as Int.max from overflowing.
+    guard bodyLength <= buffer.count - headerBytes else {
       return nil  // Need more data for body
     }
+    let totalLength = headerBytes + bodyLength
 
     var body = Data()
     if bodyLength > 0 {
@@ -137,8 +145,10 @@ public struct RTSPParser: Sendable {
 
   /// Parse "RTSP/1.0 200 OK" into components.
   func parseStatusLine(_ line: String) throws -> (String, UInt16, String) {
-    // Split into at most 3 parts: version, status code, reason phrase
-    let parts = line.split(separator: " ", maxSplits: 2, omittingEmptySubsequences: false)
+    // Split into at most 3 parts: version, status code, reason phrase.
+    // Collapse repeated spaces (some cameras/proxies emit "RTSP/1.0  200 OK")
+    // so the status code is read from the right field.
+    let parts = line.split(separator: " ", maxSplits: 2, omittingEmptySubsequences: true)
     guard parts.count >= 2 else {
       throw RTSPError.depacketizationError("Invalid RTSP status line: \(line)")
     }
