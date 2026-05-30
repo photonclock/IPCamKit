@@ -89,7 +89,11 @@ struct InorderParser: Sendable {
     var loss: UInt16 = 0
     if let expected = nextSeq {
       let delta = raw.sequenceNumber &- expected
-      if delta > 0x8000 {
+      // Top bit set (delta in 0x8000...0xFFFF) means the packet sits in the
+      // backward half of the sequence space: out of order or a duplicate.
+      // 0x8000 itself is maximally ambiguous; treat it as out of order rather
+      // than reporting a spurious 32768-packet loss.
+      if delta >= 0x8000 {
         // Out of order. UDP reordering is normal and stays silent; TCP-interleaved
         // reordering means the camera's packetizer wrote sequence-numbers out of
         // order before muxing, which is camera misbehavior worth surfacing.

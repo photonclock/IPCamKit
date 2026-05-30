@@ -82,7 +82,7 @@ public enum StreamContext: Sendable, CustomStringConvertible, CustomDebugStringC
   public var description: String {
     switch self {
     case .tcp(let tcp):
-      return "TCP, interleaved channel ids \(tcp.rtpChannelId)-\(tcp.rtpChannelId + 1)"
+      return "TCP, interleaved channel ids \(tcp.rtpChannelId)-\(Int(tcp.rtpChannelId) + 1)"
     case .udp(let udp):
       return udp.description
     case .dummy:
@@ -121,7 +121,7 @@ public struct UdpStreamContext: Sendable, CustomStringConvertible {
   }
 
   public var description: String {
-    "\(localIP):\(localRtpPort)-\(localRtpPort + 1)(me) -> \(peerIP):\(peerRtpPort)-\(peerRtpPort + 1)"
+    "\(localIP):\(localRtpPort)-\(Int(localRtpPort) + 1)(me) -> \(peerIP):\(peerRtpPort)-\(Int(peerRtpPort) + 1)"
   }
 }
 
