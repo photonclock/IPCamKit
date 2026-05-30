@@ -181,4 +181,18 @@ actor RTSPTransportConnection {
   var ctx: ConnectionContext {
     connectionContext ?? .dummy()
   }
+
+  /// The resolved remote IPv4 address of the control connection, if available.
+  /// Lets UDP transport target the server's RTP/RTCP ports without a second DNS
+  /// lookup when the SETUP response omits an explicit `source`. Returns `nil`
+  /// for IPv6 / unresolved endpoints.
+  func remoteIPv4() -> String? {
+    guard case .hostPort(let host, _)? = connection?.currentPath?.remoteEndpoint else {
+      return nil
+    }
+    if case .ipv4(let addr) = host {
+      return "\(addr)"
+    }
+    return nil
+  }
 }

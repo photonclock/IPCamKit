@@ -141,6 +141,13 @@ final class UDPPair: @unchecked Sendable {
     try Self.connectFD(rtcpFD, host: peerHost, port: peerRTPPort + 1)
   }
 
+  /// Whether `host` is already a numeric IPv4 literal (so `connect()` can use it
+  /// without a hostname resolution this IPv4-only path does not perform).
+  static func isNumericIPv4(_ host: String) -> Bool {
+    var addr = in_addr()
+    return inet_pton(AF_INET, host, &addr) == 1
+  }
+
   private static func connectFD(_ fd: Int32, host: String, port: UInt16) throws {
     var addr = sockaddr_in()
     addr.sin_family = sa_family_t(AF_INET)
