@@ -23,6 +23,9 @@ public struct Credentials: Sendable {
 struct RTSPAuthenticator: Sendable {
   private let credentials: Credentials
   private var digestState: DigestState?
+  /// Set once the server has offered Basic, so later requests can attach it
+  /// pre-emptively instead of paying a fresh 401 round-trip every time.
+  private var basicChallengeSeen = false
 
   init(credentials: Credentials) {
     self.credentials = credentials
@@ -31,14 +34,19 @@ struct RTSPAuthenticator: Sendable {
   /// Parse a WWW-Authenticate header and update internal state.
   mutating func handleChallenge(_ wwwAuthenticate: String) {
     let trimmed = wwwAuthenticate.trimmingCharacters(in: .whitespaces)
-    if trimmed.lowercased().hasPrefix("digest") {
+    let lower = trimmed.lowercased()
+    if lower.hasPrefix("digest") {
       let state = parseDigestChallenge(String(trimmed.dropFirst(6)))
       // A digest challenge without a nonce is unusable; ignore it rather than
-      // emit a bogus Authorization header. Accepting a fresh challenge also
-      // resets the nonce-count (nc starts at 0).
-      digestState = state.nonce.isEmpty ? nil : state
+      // emit a bogus Authorization header — and never let a nonce-less re-offer
+      // (or a second challenge line) clobber a good earlier Digest challenge.
+      // A usable challenge replaces any prior one, resetting nc (nc starts 0).
+      if !state.nonce.isEmpty {
+        digestState = state
+      }
+    } else if lower.hasPrefix("basic") {
+      basicChallengeSeen = true
     }
-    // Basic auth doesn't need to parse the challenge
   }
 
   /// Generate an Authorization header value for the given request.
@@ -55,7 +63,7 @@ struct RTSPAuthenticator: Sendable {
 
   /// Whether we have received a challenge and can generate auth headers.
   var hasChallenge: Bool {
-    digestState != nil
+    digestState != nil || basicChallengeSeen
   }
 
   // MARK: - Basic Auth
@@ -88,8 +96,13 @@ struct RTSPAuthenticator: Sendable {
       let kv = param.split(separator: "=", maxSplits: 1)
       guard kv.count == 2 else { continue }
       let key = kv[0].trimmingCharacters(in: .whitespaces).lowercased()
-      let value = kv[1].trimmingCharacters(in: .whitespaces)
-        .trimmingCharacters(in: CharacterSet(charactersIn: "\""))
+      let value = unquote(String(kv[1]))
+      // Reject control characters (a bare CR/LF/tab/DEL) in a challenge value:
+      // they're illegal in an RFC 7230/7616 quoted-string, and echoing one into
+      // the Authorization header would inject control bytes into the request.
+      // Dropping the param fails the challenge safely (e.g. an empty nonce).
+      guard !value.unicodeScalars.contains(where: { $0.value < 0x20 || $0.value == 0x7F })
+      else { continue }
 
       switch key {
       case "realm": realm = value
@@ -145,21 +158,24 @@ struct RTSPAuthenticator: Sendable {
     }
     let ha2 = hashHex(hash, "\(method):\(uri)")
 
+    // Quoted-string fields are escaped (RFC 7616); the hash inputs above use the
+    // raw, unescaped values. `algorithm`, `qop=auth`, and `nc=` stay unquoted —
+    // they are RFC tokens, not quoted-strings.
     var header =
-      "Digest username=\"\(credentials.username)\", realm=\"\(state.realm)\", "
-      + "nonce=\"\(state.nonce)\", uri=\"\(uri)\", algorithm=\(state.algorithm)"
+      "Digest username=\(quote(credentials.username)), realm=\(quote(state.realm)), "
+      + "nonce=\(quote(state.nonce)), uri=\(quote(uri)), algorithm=\(state.algorithm)"
 
     if let qop = state.qop, qopOffersAuth(qop) {
       state.nc &+= 1
       let nc = String(format: "%08x", state.nc)
       let response = hashHex(hash, "\(ha1):\(state.nonce):\(nc):\(cnonce):auth:\(ha2)")
-      header += ", response=\"\(response)\", qop=auth, nc=\(nc), cnonce=\"\(cnonce)\""
+      header += ", response=\(quote(response)), qop=auth, nc=\(nc), cnonce=\(quote(cnonce))"
     } else {
       let response = hashHex(hash, "\(ha1):\(state.nonce):\(ha2)")
-      header += ", response=\"\(response)\""
+      header += ", response=\(quote(response))"
     }
     if let opaque = state.opaque {
-      header += ", opaque=\"\(opaque)\""
+      header += ", opaque=\(quote(opaque))"
     }
     digestState = state  // persist the advanced nonce-count
     return header
@@ -170,13 +186,54 @@ struct RTSPAuthenticator: Sendable {
     return bytes.map { String(format: "%02x", $0) }.joined()
   }
 
-  /// Split auth parameters, handling quoted strings with commas inside.
+  /// Encode a string as an RFC 7616 quoted-string: escape `\` then `"`, wrap in
+  /// quotes. Used only for header construction — never for hash inputs.
+  private func quote(_ s: String) -> String {
+    let escaped = s.replacingOccurrences(of: "\\", with: "\\\\")
+      .replacingOccurrences(of: "\"", with: "\\\"")
+    return "\"\(escaped)\""
+  }
+
+  /// Decode an auth parameter value: trim surrounding whitespace, and if it is a
+  /// quoted-string strip exactly one surrounding pair of quotes and unescape
+  /// `\\`/`\"` (RFC 7616). Bare token values pass through unchanged. A blanket
+  /// quote-trim would mishandle escaped quotes and over-strip.
+  private func unquote(_ raw: String) -> String {
+    let v = raw.trimmingCharacters(in: .whitespaces)
+    guard v.count >= 2, v.hasPrefix("\""), v.hasSuffix("\"") else { return v }
+    var out = ""
+    out.reserveCapacity(v.count)
+    var escaped = false
+    for ch in v.dropFirst().dropLast() {
+      if escaped {
+        out.append(ch)
+        escaped = false
+      } else if ch == "\\" {
+        escaped = true
+      } else {
+        out.append(ch)
+      }
+    }
+    if escaped { out.append("\\") }  // dangling backslash: keep literal
+    return out
+  }
+
+  /// Split auth parameters on commas, honoring quoted strings (commas inside a
+  /// quoted-string don't split) and backslash escaping inside quotes (so a `\"`
+  /// doesn't prematurely close the quote).
   private func splitAuthParams(_ params: String) -> [String] {
     var result: [String] = []
     var current = ""
     var inQuotes = false
+    var escaped = false
     for ch in params {
-      if ch == "\"" {
+      if escaped {
+        current.append(ch)
+        escaped = false
+      } else if ch == "\\" && inQuotes {
+        current.append(ch)
+        escaped = true
+      } else if ch == "\"" {
         inQuotes.toggle()
         current.append(ch)
       } else if ch == "," && !inQuotes {

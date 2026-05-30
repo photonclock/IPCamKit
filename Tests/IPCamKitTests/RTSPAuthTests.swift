@@ -127,4 +127,49 @@ struct RTSPAuthTests {
     auth.handleChallenge("Digest realm=\"test\", nonce=\"\"")
     #expect(!auth.hasChallenge)
   }
+
+  @Test("Basic challenge enables pre-emptive auth (finding #10)")
+  func basicChallengeEnablesPreemptiveAuth() {
+    var auth = RTSPAuthenticator(credentials: Credentials(username: "u", password: "p"))
+    #expect(!auth.hasChallenge)
+    auth.handleChallenge("Basic realm=\"cam\"")
+    #expect(auth.hasChallenge)
+    let header = auth.authorize(method: "DESCRIBE", uri: "rtsp://h/p")
+    #expect(header?.hasPrefix("Basic ") == true)
+  }
+
+  @Test("Digest quoted-string fields are escaped (finding #38)")
+  func digestEscapesQuotedFields() {
+    var auth = RTSPAuthenticator(
+      credentials: Credentials(username: "ad\"min", password: "p"))
+    auth.handleChallenge("Digest realm=\"test\", nonce=\"abc123\"")
+    let header = auth.authorize(method: "DESCRIBE", uri: "rtsp://h/p")
+    #expect(header != nil)
+    // The quote in the username must be backslash-escaped, not left raw (which
+    // would truncate the field and corrupt the whole header).
+    #expect(header!.contains("username=\"ad\\\"min\""))
+  }
+
+  @Test("Control characters in a challenge value are rejected (no header injection)")
+  func digestRejectsControlCharsInChallenge() {
+    var auth = RTSPAuthenticator(
+      credentials: Credentials(username: "user", password: "pass"))
+    // A server-injected bare CR in the nonce must not reach the header; dropping
+    // the nonce leaves the challenge unusable.
+    auth.handleChallenge("Digest realm=\"r\", nonce=\"ab\rcd\"")
+    #expect(!auth.hasChallenge)
+  }
+
+  @Test("Digest challenge value with an escaped quote is decoded (finding #40)")
+  func digestUnquotesEscapedQuote() {
+    var auth = RTSPAuthenticator(
+      credentials: Credentials(username: "user", password: "pass"))
+    // nonce carries an escaped quote on the wire: ab"cd
+    auth.handleChallenge("Digest realm=\"r\", nonce=\"ab\\\"cd\"")
+    #expect(auth.hasChallenge)
+    let header = auth.authorize(method: "DESCRIBE", uri: "rtsp://h/p")
+    #expect(header != nil)
+    // Re-emitted escaped: nonce="ab\"cd". (Hash input uses the raw decoded value.)
+    #expect(header!.contains("nonce=\"ab\\\"cd\""))
+  }
 }

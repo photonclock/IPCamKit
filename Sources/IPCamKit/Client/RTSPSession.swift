@@ -1155,32 +1155,46 @@ actor SessionState {
 
     let resp = try await conn.sendRequest(request)
 
-    // Handle 401 Unauthorized — retry with auth
+    // Handle 401 Unauthorized — retry with auth.
     if resp.statusCode == 401 {
-      if var auth = authenticator,
-        let wwwAuth = resp.header("WWW-Authenticate")
-      {
-        auth.handleChallenge(wwwAuth)
-
-        var retryRequest = RTSPRequest(method: method, url: url)
-        retryRequest.setHeader("CSeq", value: "\(nextCSeq())")
-        if let authHeader = auth.authorize(method: method.rawValue, uri: url) {
-          retryRequest.setHeader("Authorization", value: authHeader)
+      if var auth = authenticator {
+        // Feed every challenge (a server may offer Basic and Digest on separate
+        // WWW-Authenticate lines) so Digest wins regardless of ordering.
+        for challenge in resp.headers(named: "WWW-Authenticate") {
+          auth.handleChallenge(challenge)
         }
-        // Persist after authorize so the advanced nonce-count survives.
         authenticator = auth
-        for (name, value) in extraHeaders {
-          retryRequest.setHeader(name, value: value)
+        if auth.hasChallenge {
+          // Rebuild the retry the same way the first attempt did: a 401 on
+          // SETUP/PLAY requires the Session (and User-Agent) headers preserved,
+          // or the retry is rejected. Authorization is set last so a freshly
+          // computed digest isn't clobbered by a caller-supplied extra header.
+          var retryRequest = RTSPRequest(method: method, url: url)
+          retryRequest.setHeader("CSeq", value: "\(nextCSeq())")
+          if let userAgent = userAgent, !userAgent.isEmpty {
+            retryRequest.setHeader("User-Agent", value: userAgent)
+          }
+          if let sid = sessionId {
+            retryRequest.setHeader("Session", value: sid)
+          }
+          for (name, value) in extraHeaders {
+            retryRequest.setHeader(name, value: value)
+          }
+          if let authHeader = auth.authorize(method: method.rawValue, uri: url) {
+            retryRequest.setHeader("Authorization", value: authHeader)
+          }
+          // Persist after authorize so the advanced nonce-count survives.
+          authenticator = auth
+          let retryResp = try await conn.sendRequest(retryRequest)
+          if retryResp.statusCode == 401 {
+            throw RTSPError.authenticationFailed
+          }
+          guard retryResp.statusCode >= 200 && retryResp.statusCode < 300 else {
+            throw RTSPError.sessionSetupFailed(
+              statusCode: Int(retryResp.statusCode), reason: retryResp.reasonPhrase)
+          }
+          return retryResp
         }
-        let retryResp = try await conn.sendRequest(retryRequest)
-        if retryResp.statusCode == 401 {
-          throw RTSPError.authenticationFailed
-        }
-        guard retryResp.statusCode >= 200 && retryResp.statusCode < 300 else {
-          throw RTSPError.sessionSetupFailed(
-            statusCode: Int(retryResp.statusCode), reason: retryResp.reasonPhrase)
-        }
-        return retryResp
       }
       throw RTSPError.authenticationFailed
     }
