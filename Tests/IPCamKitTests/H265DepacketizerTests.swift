@@ -325,6 +325,24 @@ struct H265NALTests {
     #expect(timing.timeScale == 12)
   }
 
+  /// An oversized parameter NAL must be rejected with an error rather than
+  /// trapping the process in the u16-length HEVC record builder (finding #4).
+  @Test("Oversized parameter NAL is rejected, not a trap")
+  func oversizedParameterNALRejected() throws {
+    let vps = Data(base64Encoded: "QAEMAf//AWAAAAMAsAAAAwAAAwBarAwAAAMABAAAAwAyqA==")!
+    let sps = Data(
+      base64Encoded: "QgEBAWAAAAMAsAAAAwAAAwBaoAWCAeFja5JFL83BQYFBAAADAAEAAAMADKE=")!
+    let pps = Data(base64Encoded: "RAHA8saNA7NA")!
+    // The valid trio parses.
+    _ = try H265Parameters.parseVPSSPSPPS(vps: vps, sps: sps, pps: pps)
+    // A VPS padded past 65535 bytes must throw (the record stores NAL lengths in
+    // a u16), not trap.
+    let hugeVPS = vps + Data(repeating: 0, count: 70_000)
+    #expect(throws: RTSPError.self) {
+      _ = try H265Parameters.parseVPSSPSPPS(vps: hugeVPS, sps: sps, pps: pps)
+    }
+  }
+
   /// Test 8: Parse SPS with inter-predicted ShortTermRefPicSet.
   @Test("Parse SPS with inter ref pic set prediction")
   func parseSPSWithInterRefPicSetPrediction() throws {

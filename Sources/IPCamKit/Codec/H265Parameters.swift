@@ -100,6 +100,14 @@ struct H265Parameters: Sendable, Equatable {
     let ppsRBSP = decodeRBSP(ppsBody)
     let pps = try parseH265PPS(ppsRBSP)
 
+    // The HEVCDecoderConfigurationRecord stores each NAL length in a u16, so a
+    // parameter NAL over 65535 bytes would trap building it. Reject up front,
+    // mirroring the H264 path. (No real camera emits a >64 KiB parameter set.)
+    guard vpsNAL.count <= 0xFFFF, spsNAL.count <= 0xFFFF, ppsNAL.count <= 0xFFFF else {
+      throw RTSPError.depacketizationError(
+        "VPS/SPS/PPS NAL exceeds 65535 bytes; cannot fit the HEVC record u16 length")
+    }
+
     let rfc6381Codec = sps.rfc6381Codec()
     let dims = try sps.pixelDimensions()
     guard let width = UInt16(exactly: dims.0), let height = UInt16(exactly: dims.1) else {

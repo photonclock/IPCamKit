@@ -597,17 +597,18 @@ struct H265Sps: Sendable {
     var width = picWidthInLumaSamples
     var height = picHeightInLumaSamples
     if let c = conformanceWindow {
-      let widthShift: UInt32 = (chromaFormatIdc == 1 || chromaFormatIdc == 2) ? 1 : 0
-      let heightShift: UInt32 = chromaFormatIdc == 1 ? 1 : 0
-      let lr = c.leftOffset &+ c.rightOffset
-      let tb = c.topOffset &+ c.bottomOffset
-      let subW = lr << widthShift
-      let subH = tb << heightShift
-      guard width >= subW, height >= subH else {
+      // Compute the crop in 64-bit so malformed offsets can't wrap a 32-bit add
+      // to a small/zero value and silently yield wrong dimensions. The crop must
+      // leave a positive picture (H.265 §7.4.3.2.1), so reject when it doesn't.
+      let widthShift: UInt64 = (chromaFormatIdc == 1 || chromaFormatIdc == 2) ? 1 : 0
+      let heightShift: UInt64 = chromaFormatIdc == 1 ? 1 : 0
+      let subW = (UInt64(c.leftOffset) + UInt64(c.rightOffset)) << widthShift
+      let subH = (UInt64(c.topOffset) + UInt64(c.bottomOffset)) << heightShift
+      guard subW < UInt64(width), subH < UInt64(height) else {
         throw RTSPError.depacketizationError("bad conformance window")
       }
-      width -= subW
-      height -= subH
+      width -= UInt32(subW)
+      height -= UInt32(subH)
     }
     return (width, height)
   }
@@ -699,14 +700,16 @@ func parseH265SPS(_ rbsp: Data) throws -> H265Sps {
   guard let bitDepthLuma = reader.readExpGolomb() else {
     throw RTSPError.depacketizationError("SPS: can't read bit_depth_luma_minus8")
   }
-  guard bitDepthLuma <= 8 else {
-    throw RTSPError.depacketizationError("bit_depth_luma_minus8 must be in [0, 8]")
+  guard bitDepthLuma <= 6 else {
+    // H.265 caps bit depth at 14-bit (minus8 in [0,6]); a value of 7/8 would
+    // also collide with the reserved bit in the 3-bit HEVC-record field.
+    throw RTSPError.depacketizationError("bit_depth_luma_minus8 must be in [0, 6]")
   }
   guard let bitDepthChroma = reader.readExpGolomb() else {
     throw RTSPError.depacketizationError("SPS: can't read bit_depth_chroma_minus8")
   }
-  guard bitDepthChroma <= 8 else {
-    throw RTSPError.depacketizationError("bit_depth_chroma_minus8 must be in [0, 8]")
+  guard bitDepthChroma <= 6 else {
+    throw RTSPError.depacketizationError("bit_depth_chroma_minus8 must be in [0, 6]")
   }
 
   guard let log2MaxPicOrderCntLsbMinus4 = reader.readExpGolomb() else {
