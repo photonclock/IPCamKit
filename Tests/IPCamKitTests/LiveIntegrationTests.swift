@@ -105,13 +105,24 @@ private func canConnectLoopback(_ port: UInt16) -> Bool {
 
 /// Owns a MediaMTX server + ffmpeg publisher for the lifetime of one test, and
 /// guarantees both are killed on teardown.
-final class LiveStreamFixture {
-  let rtspURL: String
+///
+/// All blocking process/socket work (port reservation, launch, port-wait) runs
+/// on a dedicated `DispatchQueue`, NOT on a Swift Concurrency cooperative
+/// thread. Under the test runner's default parallelism, blocking a cooperative
+/// thread can wedge the shared pool and deadlock unrelated tests; confining the
+/// blocking work to a private thread avoids that. `@unchecked Sendable` is safe
+/// because mutable state is only touched inside `startSync` (on `queue`) and in
+/// `shutDown` (after `start()` has fully completed — a happens-before barrier).
+final class LiveStreamFixture: @unchecked Sendable {
+  private(set) var rtspURL = ""
 
-  private let rtspPort: UInt16
+  private let transports: [String]
+  private let readTimeoutSeconds: Int?
+  private let ffmpegArgs: [String]
+  private let marker: String
   private let configPath: String
   private let logPath: String
-  private let marker: String
+  private let queue: DispatchQueue
   private let mediamtx = Process()
   private let ffmpeg = Process()
   private var launched: [Process] = []
@@ -120,21 +131,50 @@ final class LiveStreamFixture {
   ///   - transports: value for MediaMTX `rtspTransports` (e.g. `[tcp]`).
   ///   - ffmpegArgs: ffmpeg args between the program name and the output URL
   ///     (inputs + codec options); the `-f rtsp ... <url>` tail is appended.
-  init(transports: [String] = ["tcp", "udp"], ffmpegArgs: [String]) throws {
+  init(
+    transports: [String] = ["tcp", "udp"],
+    readTimeoutSeconds: Int? = nil,
+    ffmpegArgs: [String]
+  ) {
     let token = UUID().uuidString.prefix(8)
+    self.transports = transports
+    self.readTimeoutSeconds = readTimeoutSeconds
+    self.ffmpegArgs = ffmpegArgs
     self.marker = "ipcamkit-live-\(token)"
+    self.configPath = NSTemporaryDirectory() + "ipcamkit-live-\(token).yml"
+    self.logPath = NSTemporaryDirectory() + "ipcamkit-live-\(token).log"
+    self.queue = DispatchQueue(label: "ipcamkit.live.\(token)")
+  }
+
+  /// PATH that includes the usual Homebrew + system locations so `/usr/bin/env`
+  /// resolves `mediamtx`/`ffmpeg` regardless of how the test runner was invoked.
+  private static func childEnvironment() -> [String: String] {
+    var env = ProcessInfo.processInfo.environment
+    let extra = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"
+    env["PATH"] = env["PATH"].map { "\(extra):\($0)" } ?? extra
+    return env
+  }
+
+  /// Reserve ports, launch MediaMTX, wait for its RTSP port, then launch the
+  /// ffmpeg publisher — all on the private queue so the calling cooperative
+  /// thread only suspends (never blocks).
+  func start() async throws {
+    try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+      queue.async {
+        continuation.resume(with: Result { try self.startSync() })
+      }
+    }
+  }
+
+  private func startSync() throws {
     guard let ports = reserveServerPorts() else {
       throw LiveError("could not reserve RTSP + RTP/RTCP server ports")
     }
-    self.rtspPort = ports.rtsp
-    let rtpPort = ports.rtp
-    let rtcpPort = ports.rtcp
-    self.configPath = NSTemporaryDirectory() + "\(marker).yml"
-    self.logPath = NSTemporaryDirectory() + "\(marker).log"
-    self.rtspURL = "rtsp://127.0.0.1:\(rtspPort)/\(marker)"
+    rtspURL = "rtsp://127.0.0.1:\(ports.rtsp)/\(marker)"
 
+    let readTimeoutLine = readTimeoutSeconds.map { "readTimeout: \($0)s\n" } ?? ""
     let config = """
-      logLevel: error
+      \(readTimeoutLine)logLevel: error
       api: false
       metrics: false
       pprof: false
@@ -145,9 +185,9 @@ final class LiveStreamFixture {
       srt: false
       rtsp: true
       rtspTransports: [\(transports.joined(separator: ", "))]
-      rtspAddress: :\(rtspPort)
-      rtpAddress: :\(rtpPort)
-      rtcpAddress: :\(rtcpPort)
+      rtspAddress: :\(ports.rtsp)
+      rtpAddress: :\(ports.rtp)
+      rtcpAddress: :\(ports.rtcp)
       paths:
         all_others:
       """
@@ -174,44 +214,38 @@ final class LiveStreamFixture {
     ffmpeg.standardOutput = FileHandle.nullDevice
     ffmpeg.standardError = FileHandle.nullDevice
     ffmpeg.environment = env
-  }
 
-  /// PATH that includes the usual Homebrew + system locations so `/usr/bin/env`
-  /// resolves `mediamtx`/`ffmpeg` regardless of how the test runner was invoked.
-  private static func childEnvironment() -> [String: String] {
-    var env = ProcessInfo.processInfo.environment
-    let extra = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"
-    env["PATH"] = env["PATH"].map { "\(extra):\($0)" } ?? extra
-    return env
-  }
-
-  /// Launch MediaMTX, wait for its RTSP port, then launch the ffmpeg publisher.
-  func start() async throws {
     try mediamtx.run()
     launched.append(mediamtx)
 
-    let deadline = ContinuousClock.now + .seconds(10)
-    while ContinuousClock.now < deadline {
-      if canConnectLoopback(rtspPort) { break }
-      try await Task.sleep(for: .milliseconds(150))
+    // Blocking poll on this private thread (≈10s budget): fine here, off the
+    // cooperative pool.
+    var opened = false
+    for _ in 0..<67 {
+      if canConnectLoopback(ports.rtsp) {
+        opened = true
+        break
+      }
+      usleep(150_000)
     }
-    guard canConnectLoopback(rtspPort) else {
+    guard opened else {
       let log = (try? String(contentsOfFile: logPath, encoding: .utf8)) ?? "<no log>"
       throw LiveError(
-        "mediamtx RTSP port \(rtspPort) did not open within 10s. mediamtx log:\n\(log)")
+        "mediamtx RTSP port \(ports.rtsp) did not open within 10s. mediamtx log:\n\(log)")
     }
 
     try ffmpeg.run()
     launched.append(ffmpeg)
   }
 
-  /// Terminate both processes (SIGTERM, then SIGKILL backstop) and remove the
-  /// temp config. Safe to call more than once.
+  /// Terminate both processes and remove the temp files. Runs on the calling
+  /// (cooperative) thread but does only fast, non-blocking work: SIGTERM plus a
+  /// SIGKILL backstop (`pkill -9 -f <marker>`), with no `waitUntilExit`. The
+  /// processes die asynchronously; the next serialized test uses fresh ports.
   func shutDown() {
     for p in launched where p.isRunning { p.terminate() }
+    launched.removeAll()
 
-    // SIGKILL backstop for any straggler matching our unique marker (the config
-    // path for mediamtx, the stream URL for ffmpeg).
     let pkill = Process()
     pkill.executableURL = URL(fileURLWithPath: "/usr/bin/env")
     pkill.arguments = ["pkill", "-9", "-f", marker]
@@ -219,10 +253,7 @@ final class LiveStreamFixture {
     pkill.standardError = FileHandle.nullDevice
     pkill.environment = Self.childEnvironment()
     try? pkill.run()
-    pkill.waitUntilExit()
 
-    for p in launched { p.waitUntilExit() }
-    launched.removeAll()
     try? FileManager.default.removeItem(atPath: configPath)
     try? FileManager.default.removeItem(atPath: logPath)
   }
@@ -238,6 +269,23 @@ private actor ItemSink {
   func finish(_ error: Error?) {
     finished = true
     failure = error
+  }
+}
+
+/// Thread-safe collector for the `RTSPDiagnostic` messages a session emits via
+/// its synchronous `onDiagnostic` callback.
+private final class DiagnosticLog: @unchecked Sendable {
+  private let lock = NSLock()
+  private var messages: [String] = []
+  func add(_ message: String) {
+    lock.lock()
+    messages.append(message)
+    lock.unlock()
+  }
+  var all: [String] {
+    lock.lock()
+    defer { lock.unlock() }
+    return messages
   }
 }
 
@@ -277,14 +325,13 @@ private func collectItems(
 /// elapses. A fresh session per attempt avoids carrying partial state across the
 /// 404s MediaMTX returns until the publisher's stream is ready.
 private func startSessionWithRetry(
-  url: String,
-  transport: Transport,
-  deadline: Duration
+  deadline: Duration,
+  _ makeSession: () -> RTSPClientSession
 ) async throws -> (RTSPClientSession, SessionDescription) {
   let endBy = ContinuousClock.now + deadline
   var lastError: Error?
   while ContinuousClock.now < endBy {
-    let session = RTSPClientSession(url: url, transport: transport)
+    let session = makeSession()
     do {
       let desc = try await session.start()
       return (session, desc)
@@ -335,7 +382,7 @@ struct LiveIntegrationTests {
   func h264OverTCP() async throws {
     let watchdog = liveWatchdog(.seconds(45))
     defer { watchdog.cancel() }
-    let fixture = try LiveStreamFixture(ffmpegArgs: [
+    let fixture = LiveStreamFixture(ffmpegArgs: [
       "-re", "-f", "lavfi", "-i", "testsrc2=size=320x240:rate=15",
       "-c:v", "libx264", "-preset", "ultrafast", "-tune", "zerolatency",
       "-g", "15", "-pix_fmt", "yuv420p", "-an",
@@ -343,8 +390,9 @@ struct LiveIntegrationTests {
     defer { fixture.shutDown() }
     try await fixture.start()
 
-    let (session, desc) = try await startSessionWithRetry(
-      url: fixture.rtspURL, transport: .tcp, deadline: .seconds(20))
+    let (session, desc) = try await startSessionWithRetry(deadline: .seconds(20)) {
+      RTSPClientSession(url: fixture.rtspURL, transport: .tcp)
+    }
     #expect(desc.video?.codec == .h264)
 
     // Teardown is via fixture.shutDown() (defer), which kills the server and
@@ -383,7 +431,7 @@ struct LiveIntegrationTests {
     // `no-open-gop=1` forces closed-GOP IDR keyframes (libx265 defaults to
     // open-GOP CRA, which — like retina — is not treated as a random-access
     // point). `repeat-headers=1` re-sends VPS/SPS/PPS in-band before each IDR.
-    let fixture = try LiveStreamFixture(ffmpegArgs: [
+    let fixture = LiveStreamFixture(ffmpegArgs: [
       "-re", "-f", "lavfi", "-i", "testsrc2=size=320x240:rate=15",
       "-c:v", "libx265", "-tag:v", "hvc1", "-preset", "ultrafast",
       "-x265-params", "keyint=15:min-keyint=15:no-open-gop=1:repeat-headers=1",
@@ -392,8 +440,9 @@ struct LiveIntegrationTests {
     defer { fixture.shutDown() }
     try await fixture.start()
 
-    let (session, desc) = try await startSessionWithRetry(
-      url: fixture.rtspURL, transport: .tcp, deadline: .seconds(20))
+    let (session, desc) = try await startSessionWithRetry(deadline: .seconds(20)) {
+      RTSPClientSession(url: fixture.rtspURL, transport: .tcp)
+    }
     #expect(desc.video?.codec == .h265)
 
     let items = await collectItems(from: session, deadline: .seconds(12)) {
@@ -417,7 +466,7 @@ struct LiveIntegrationTests {
   func h264AacOverTCP() async throws {
     let watchdog = liveWatchdog(.seconds(45))
     defer { watchdog.cancel() }
-    let fixture = try LiveStreamFixture(ffmpegArgs: [
+    let fixture = LiveStreamFixture(ffmpegArgs: [
       "-re",
       "-f", "lavfi", "-i", "testsrc2=size=320x240:rate=15",
       "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=48000",
@@ -429,8 +478,9 @@ struct LiveIntegrationTests {
     defer { fixture.shutDown() }
     try await fixture.start()
 
-    let (session, desc) = try await startSessionWithRetry(
-      url: fixture.rtspURL, transport: .tcp, deadline: .seconds(20))
+    let (session, desc) = try await startSessionWithRetry(deadline: .seconds(20)) {
+      RTSPClientSession(url: fixture.rtspURL, transport: .tcp)
+    }
     #expect(desc.video?.codec == .h264)
     #expect(desc.audio != nil, "expected an audio stream in the SDP")
     #expect(desc.audio?.sampleRate == 48000)
@@ -443,5 +493,47 @@ struct LiveIntegrationTests {
     let af = audioFrames(items)
     #expect(!af.isEmpty, "expected audio frames")
     #expect(af.allSatisfy { $0.sampleRate == 48000 }, "audio sample rate should be 48 kHz")
+  }
+
+  @Test("Keepalive sustains a session past the server read timeout")
+  func keepaliveSustainsSession() async throws {
+    let watchdog = liveWatchdog(.seconds(45))
+    defer { watchdog.cancel() }
+
+    // MediaMTX drops a reader that sends nothing within `readTimeout`. With a 3s
+    // read timeout and a 1s keepalive, the session must survive well beyond 3s —
+    // which only happens if keepalive requests are interleaved with the RTP and
+    // acknowledged on the same TCP connection.
+    let fixture = LiveStreamFixture(
+      transports: ["tcp"],
+      readTimeoutSeconds: 3,
+      ffmpegArgs: [
+        "-re", "-f", "lavfi", "-i", "testsrc2=size=320x240:rate=15",
+        "-c:v", "libx264", "-preset", "ultrafast", "-tune", "zerolatency",
+        "-g", "15", "-pix_fmt", "yuv420p", "-an",
+      ])
+    defer { fixture.shutDown() }
+    try await fixture.start()
+
+    let log = DiagnosticLog()
+    let (session, _) = try await startSessionWithRetry(deadline: .seconds(20)) {
+      RTSPClientSession(
+        url: fixture.rtspURL, credentials: nil, transport: .tcp,
+        userAgent: "IPCamKit", onDiagnostic: { log.add($0.message) },
+        keepaliveInterval: .seconds(1))
+    }
+
+    // Run until a frame arrives from well past the 3s read-timeout window.
+    let items = await collectItems(from: session, deadline: .seconds(20)) {
+      videoFrames($0).contains { $0.timestamp > 6.0 }
+    }
+    await session.stop()
+
+    let vf = videoFrames(items)
+    #expect(
+      vf.contains { $0.timestamp > 6.0 },
+      "stream should survive well past the 3s read timeout via keepalive")
+    let acked = log.all.filter { $0.contains("keepalive") && $0.contains("acknowledged") }
+    #expect(!acked.isEmpty, "expected an acknowledged keepalive; diagnostics: \(log.all)")
   }
 }

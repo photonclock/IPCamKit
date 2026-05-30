@@ -112,19 +112,38 @@ public final class RTSPClientSession: Sendable {
   private let userAgent: String
   private let onDiagnostic: (@Sendable (RTSPDiagnostic) -> Void)?
   private let state: SessionState
+  /// Test-only override of the keepalive interval. When nil (production), the
+  /// interval is derived from the server's advertised session timeout.
+  private let keepaliveInterval: Duration?
 
-  public init(
+  public convenience init(
     url: String,
     credentials: Credentials? = nil,
     transport: Transport = .tcp,
     userAgent: String = "IPCamKit",
     onDiagnostic: (@Sendable (RTSPDiagnostic) -> Void)? = nil
   ) {
+    self.init(
+      url: url, credentials: credentials, transport: transport,
+      userAgent: userAgent, onDiagnostic: onDiagnostic, keepaliveInterval: nil)
+  }
+
+  /// Designated initializer. `keepaliveInterval` is internal and intended for
+  /// tests that need a short, deterministic keepalive cadence.
+  init(
+    url: String,
+    credentials: Credentials?,
+    transport: Transport,
+    userAgent: String,
+    onDiagnostic: (@Sendable (RTSPDiagnostic) -> Void)?,
+    keepaliveInterval: Duration?
+  ) {
     self.url = url
     self.credentials = credentials
     self.transport = transport
     self.userAgent = userAgent
     self.onDiagnostic = onDiagnostic
+    self.keepaliveInterval = keepaliveInterval
     self.state = SessionState()
   }
 
@@ -137,7 +156,8 @@ public final class RTSPClientSession: Sendable {
       credentials: credentials,
       transport: transport,
       userAgent: userAgent,
-      onDiagnostic: onDiagnostic
+      onDiagnostic: onDiagnostic,
+      keepaliveInterval: keepaliveInterval
     )
   }
 
@@ -310,15 +330,20 @@ actor SessionState {
   private var pendingResponses: [UInt32: CheckedContinuation<RTSPResponse, Error>] = [:]
   /// The periodic keepalive task, active only while streaming.
   private var keepaliveTask: Task<Void, Never>?
+  /// Test-only override of the keepalive interval; nil derives it from the
+  /// server's advertised session timeout.
+  private var keepaliveIntervalOverride: Duration?
 
   func start(
     url: String,
     credentials: Credentials?,
     transport: Transport,
     userAgent: String,
-    onDiagnostic: (@Sendable (RTSPDiagnostic) -> Void)?
+    onDiagnostic: (@Sendable (RTSPDiagnostic) -> Void)?,
+    keepaliveInterval: Duration? = nil
   ) async throws -> SessionDescription {
     self.onDiagnostic = onDiagnostic
+    self.keepaliveIntervalOverride = keepaliveInterval
 
     // UDP transport is not implemented: there is no socket pair, no
     // client_port negotiation, and the receive loop only reads TCP-interleaved
@@ -932,11 +957,11 @@ actor SessionState {
   /// else OPTIONS. Runs until the reader loop ends or `stop()` cancels it.
   private func startKeepalive() {
     keepaliveTask?.cancel()
-    let period = max(1.0, Double(sessionTimeoutSec) / 2.0)
+    let period = keepaliveIntervalOverride ?? .seconds(max(1.0, Double(sessionTimeoutSec) / 2.0))
     let method: RTSPMethod = getParameterSupported ? .getParameter : .options
     keepaliveTask = Task { [weak self] in
       while !Task.isCancelled {
-        try? await Task.sleep(for: .seconds(period))
+        try? await Task.sleep(for: period)
         guard !Task.isCancelled, let self else { return }
         await self.sendKeepalive(method: method)
       }
