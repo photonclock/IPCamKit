@@ -71,7 +71,7 @@ struct H264Depacketizer: Sendable {
       AccessUnit(
         startCtx: pkt.ctx, endCtx: pkt.ctx,
         timestamp: pkt.timestamp, streamId: pkt.streamId,
-        fuA: nil, loss: pkt.loss + additionalLoss,
+        fuA: nil, loss: UInt16(clamping: UInt32(pkt.loss) + UInt32(additionalLoss)),
         sameTsAsPrev: sameTsAsPrev)
     }
   }
@@ -183,7 +183,7 @@ struct H264Depacketizer: Sendable {
         // Stay in Loss regardless of mark bit — once loss is detected for a
         // timestamp, ALL remaining packets for that timestamp are ignored.
         // This matches upstream behavior (h264.rs lines 349-361).
-        lossPkts += pkt.loss
+        lossPkts = UInt16(clamping: UInt32(lossPkts) + UInt32(pkt.loss))
         inputState = .loss(timestamp: lossTs, pkts: lossPkts)
         return .success(())
       }

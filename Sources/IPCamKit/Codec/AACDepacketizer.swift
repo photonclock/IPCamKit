@@ -166,7 +166,7 @@ struct AACDepacketizer: Sendable {
       state = .aggregated(
         Aggregate(
           pkt: pkt,
-          loss: prevLoss + loss,
+          loss: UInt16(clamping: UInt32(prevLoss) + UInt32(loss)),
           lossSinceMark: lossSinceMark || loss > 0,
           frameI: 0,
           frameCount: auHeadersCount,

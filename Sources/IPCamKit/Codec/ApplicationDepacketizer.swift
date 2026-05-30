@@ -48,7 +48,7 @@ struct ApplicationDepacketizer: Sendable {
 
   mutating func push(_ pkt: ReceivedRTPPacket) throws {
     precondition(ready == nil, "push() called before pull() drained the previous frame")
-    pendingLoss = pendingLoss + UInt32(pkt.loss)
+    pendingLoss = UInt32(clamping: UInt64(pendingLoss) + UInt64(pkt.loss))
 
     var skipAppend = false
 

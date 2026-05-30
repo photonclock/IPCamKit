@@ -68,7 +68,7 @@ struct H265Depacketizer: Sendable {
       AccessUnit(
         startCtx: pkt.ctx, endCtx: pkt.ctx,
         timestamp: pkt.timestamp, streamId: pkt.streamId,
-        inFU: false, loss: pkt.loss + additionalLoss,
+        inFU: false, loss: UInt16(clamping: UInt32(pkt.loss) + UInt32(additionalLoss)),
         sameTsAsPrev: sameTsAsPrev)
     }
   }
@@ -159,7 +159,7 @@ struct H265Depacketizer: Sendable {
 
     case .loss(let lossTs, var lossPkts):
       if sameTimestamp(pkt.timestamp, lossTs) {
-        lossPkts += pkt.loss
+        lossPkts = UInt16(clamping: UInt32(lossPkts) + UInt32(pkt.loss))
         inputState = .loss(timestamp: lossTs, pkts: lossPkts)
         return .success(())
       }
