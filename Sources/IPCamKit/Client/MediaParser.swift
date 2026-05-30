@@ -57,8 +57,8 @@ func parseMedia(
       "Unsupported protocol \(mediaDescription.proto) for \(media)")
   }
 
-  // Get first payload type from fmt field
-  let fmtParts = mediaDescription.fmt.split(separator: " ")
+  // Get first payload type from fmt field (tolerate tab/space separators).
+  let fmtParts = mediaDescription.fmt.split(whereSeparator: { $0 == " " || $0 == "\t" })
   guard let firstFmt = fmtParts.first else {
     throw RTSPError.invalidSDP("Empty fmt in media line")
   }

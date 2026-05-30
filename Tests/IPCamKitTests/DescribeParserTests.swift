@@ -629,6 +629,40 @@ struct DescribeParserTests {
     #expect(p.streams.count == 1)
   }
 
+  @Test("SDP attribute names are matched case-insensitively")
+  func caseInsensitiveSDPAttributes() throws {
+    let sdp = [
+      "v=0",
+      "o=- 0 0 IN IP4 0.0.0.0",
+      "s=Stream",
+      "b=AS:512",
+      "m=video 0 RTP/AVP 96",
+      "a=RTPMAP:96 H264/90000",
+      "a=Control:trackID=7",
+    ].joined(separator: "\r\n")
+    let session = try SDPParser().parse(sdp)
+    // Session-level b= is retained (finding #43).
+    #expect(session.bandwidth == "AS:512")
+    let media = session.mediaDescriptions[0]
+    // Off-case a=Control/a=RTPMAP still resolve (findings #45/#48).
+    let stream = try parseMedia(baseURL: "rtsp://host/path", mediaDescription: media)
+    #expect(stream.encodingName == "h264")
+    #expect(stream.clockRateHz == 90000)
+    #expect(stream.control == "rtsp://host/path/trackID=7")
+  }
+
+  @Test("Tab-delimited m= line parses")
+  func tabDelimitedMediaLine() throws {
+    let sdp = "v=0\r\nm=video\t0\tRTP/AVP\t96\r\na=rtpmap:96 H264/90000\r\n"
+    let session = try SDPParser().parse(sdp)
+    let media = session.mediaDescriptions[0]
+    #expect(media.media == "video")
+    #expect(media.proto == "RTP/AVP")
+    let stream = try parseMedia(baseURL: "rtsp://h/p", mediaDescription: media)
+    #expect(stream.rtpPayloadType == 96)
+    #expect(stream.encodingName == "h264")
+  }
+
   // Test 19: rtp_info_trailing_semicolon
   // Uses gw_sub (single stream) to match upstream test
   @Test("RTP-Info trailing semicolon handled correctly")

@@ -57,6 +57,8 @@ public struct SDPParser: Sendable {
       case "b":
         if currentMedia != nil {
           currentMedia!.bandwidth = value
+        } else {
+          session.bandwidth = value
         }
       case "t":
         session.timing = value
@@ -88,19 +90,29 @@ public struct SDPParser: Sendable {
 
   /// Parse an `a=` attribute line value.
   /// Format: `name:value` or just `name` (property attribute).
+  ///
+  /// The attribute *name* is lowercased so matching is case-insensitive,
+  /// consistent with the rest of the stack (RTSP headers, rtpmap encoding,
+  /// proto): real camera firmware sometimes emits `a=Control:`/`a=RTPMAP:`.
+  /// The *value* keeps its original case (base64 sprop, control URLs, etc.).
   func parseAttribute(_ value: String) -> SDPAttribute {
     if let colonIdx = value.firstIndex(of: ":") {
-      let name = String(value[value.startIndex..<colonIdx])
+      let name = String(value[value.startIndex..<colonIdx]).lowercased()
       let attrValue = String(value[value.index(after: colonIdx)...])
       return SDPAttribute(name: name, value: attrValue)
     }
-    return SDPAttribute(name: value, value: nil)
+    return SDPAttribute(name: value.lowercased(), value: nil)
   }
 
   /// Parse an `m=` media line.
   /// Format: `<media> <port> <proto> <fmt> [<fmt>...]`
   func parseMediaLine(_ value: String) throws -> SDPMediaDescription {
-    let parts = value.split(separator: " ", maxSplits: 3)
+    // Fields are space-delimited per RFC 8866, but tolerate tabs / repeated
+    // spaces from sloppy cameras. maxSplits 3 keeps the whole fmt list in the
+    // last field.
+    let parts = value.split(
+      maxSplits: 3, omittingEmptySubsequences: true,
+      whereSeparator: { $0 == " " || $0 == "\t" })
     guard parts.count >= 4 else {
       throw RTSPError.invalidSDP("Invalid media line: m=\(value)")
     }
