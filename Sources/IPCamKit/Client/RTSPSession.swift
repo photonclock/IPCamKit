@@ -428,7 +428,8 @@ actor SessionState {
       url: url,
       extraHeaders: [("Accept", "application/sdp")]
     )
-    var presMut = try parseDescribe(requestURL: url, response: describeResp)
+    var presMut = try parseDescribe(
+      requestURL: url, response: describeResp, onDiagnostic: onDiagnostic)
     presentation = presMut
 
     self.url = url
@@ -833,7 +834,14 @@ actor SessionState {
       }
 
       guard case .data(let interleaved) = msg else { continue }
-      guard let mapping = channelMappings.lookup(interleaved.channelId) else { continue }
+      guard let mapping = channelMappings.lookup(interleaved.channelId) else {
+        // The camera sent interleaved data on a channel we never negotiated.
+        // Drop it (can't route it) but surface it once per channel.
+        warnStreamOnce(
+          "channel.\(interleaved.channelId)", .warning,
+          "Interleaved data on unassigned channel \(interleaved.channelId); dropped.")
+        continue
+      }
 
       if mapping.channelType == .rtp {
         try routeRTP(
@@ -944,6 +952,32 @@ actor SessionState {
     onDiagnostic?(RTSPDiagnostic(severity: severity, message: message()))
   }
 
+  /// Surface (once each) the FU-reassembly anomalies the video depacketizer
+  /// tracks — an inconsistent FU NAL header or an RFC-forbidden single-fragment
+  /// FU — both tolerated but worth telling the consumer about.
+  private func surfaceVideoAnomalies(_ depkt: VideoDepacketizer) {
+    let inconsistentFu: Bool
+    let singleFragmentFu: Bool
+    switch depkt {
+    case .h264(let d):
+      inconsistentFu = d.seenInconsistentFuANalHdr
+      singleFragmentFu = d.seenSingleFragmentFuA
+    case .h265(let d):
+      inconsistentFu = d.seenInconsistentFuNalHdr
+      singleFragmentFu = d.seenSingleFragmentFu
+    }
+    if inconsistentFu {
+      warnStreamOnce(
+        "video.fuHeaderInconsistent", .warning,
+        "Camera sent FU fragments with an inconsistent NAL header; tolerated.")
+    }
+    if singleFragmentFu {
+      warnStreamOnce(
+        "video.singleFragmentFu", .info,
+        "Camera sent a single-fragment FU (RFC-forbidden); treated as a complete NAL.")
+    }
+  }
+
   /// Route one RTP packet to its stream's depacketizer, yielding any completed
   /// frames. Shared by the TCP and UDP reader loops; a missing parser or
   /// depacketizer (a disabled stream) drops the packet. A malformed wire packet
@@ -975,6 +1009,7 @@ actor SessionState {
           "video.push", .error, "Video depacketizer push failed; packet dropped: \(error)")
         return
       }
+      surfaceVideoAnomalies(depkt)
       while let result = depkt.pull() {
         switch result {
         case .success(.videoFrame(let frame)):

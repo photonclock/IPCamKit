@@ -14,7 +14,8 @@ import Foundation
 /// - Returns: A Presentation with all parsed streams
 func parseDescribe(
   requestURL: String,
-  response: RTSPResponse
+  response: RTSPResponse,
+  onDiagnostic: (@Sendable (RTSPDiagnostic) -> Void)? = nil
 ) throws -> Presentation {
   // Validate content type (warn if missing, error if wrong)
   if let ct = response.contentType {
@@ -77,7 +78,15 @@ func parseDescribe(
       let stream = try parseMedia(baseURL: baseURL, mediaDescription: mediaDesc)
       streams.append(stream)
     } catch {
+      // A stream the camera offered that we can't parse (unsupported codec, bad
+      // rtpmap, ...) is dropped. If at least one other stream parses the session
+      // still starts, so surface the drop rather than losing it silently.
       errors.append(error.localizedDescription)
+      onDiagnostic?(
+        RTSPDiagnostic(
+          severity: .warning,
+          message: "Dropping unparseable \(mediaDesc.media) stream from SDP: "
+            + error.localizedDescription))
     }
   }
 
