@@ -536,4 +536,116 @@ struct LiveIntegrationTests {
     let acked = log.all.filter { $0.contains("keepalive") && $0.contains("acknowledged") }
     #expect(!acked.isEmpty, "expected an acknowledged keepalive; diagnostics: \(log.all)")
   }
+
+  // MARK: - UDP transport
+
+  @Test("H.264 over UDP yields a keyframe with SPS/PPS")
+  func h264OverUDP() async throws {
+    let watchdog = liveWatchdog(.seconds(45))
+    defer { watchdog.cancel() }
+    // The fixture's default rtspTransports include UDP with an even/odd
+    // rtp/rtcp address pair, so the client can negotiate client_port and pull
+    // RTP/RTCP over its own UDP socket pair.
+    let fixture = LiveStreamFixture(ffmpegArgs: [
+      "-re", "-f", "lavfi", "-i", "testsrc2=size=320x240:rate=15",
+      "-c:v", "libx264", "-preset", "ultrafast", "-tune", "zerolatency",
+      "-g", "15", "-pix_fmt", "yuv420p", "-an",
+    ])
+    defer { fixture.shutDown() }
+    try await fixture.start()
+
+    let (session, desc) = try await startSessionWithRetry(deadline: .seconds(20)) {
+      RTSPClientSession(url: fixture.rtspURL, transport: .udp)
+    }
+    #expect(desc.video?.codec == .h264)
+
+    let items = await collectItems(from: session, deadline: .seconds(12)) {
+      let vf = videoFrames($0)
+      return vf.count >= 3 && vf.contains { $0.isKeyframe }
+    }
+
+    let vf = videoFrames(items)
+    #expect(!vf.isEmpty, "expected at least one video frame over UDP")
+    #expect(vf.contains { $0.isKeyframe }, "expected a keyframe (IDR) over UDP")
+    let spsAvailable = desc.video?.sps != nil || vf.contains { $0.sps != nil }
+    let ppsAvailable = desc.video?.pps != nil || vf.contains { $0.pps != nil }
+    #expect(spsAvailable, "expected SPS via SDP or in-band")
+    #expect(ppsAvailable, "expected PPS via SDP or in-band")
+    #expect(vf.allSatisfy { !$0.nalus.isEmpty }, "every frame should carry NAL units")
+
+    // Graceful stop during active UDP streaming must return promptly: TEARDOWN
+    // is routed over the TCP control connection while RTP flows on UDP, and the
+    // 45s watchdog would fail this test if stop() hung.
+    await session.stop()
+  }
+
+  @Test("H.265 over UDP yields a keyframe with VPS/SPS/PPS")
+  func h265OverUDP() async throws {
+    let watchdog = liveWatchdog(.seconds(45))
+    defer { watchdog.cancel() }
+    let fixture = LiveStreamFixture(ffmpegArgs: [
+      "-re", "-f", "lavfi", "-i", "testsrc2=size=320x240:rate=15",
+      "-c:v", "libx265", "-tag:v", "hvc1", "-preset", "ultrafast",
+      "-x265-params", "keyint=15:min-keyint=15:no-open-gop=1:repeat-headers=1",
+      "-pix_fmt", "yuv420p", "-an",
+    ])
+    defer { fixture.shutDown() }
+    try await fixture.start()
+
+    let (session, desc) = try await startSessionWithRetry(deadline: .seconds(20)) {
+      RTSPClientSession(url: fixture.rtspURL, transport: .udp)
+    }
+    #expect(desc.video?.codec == .h265)
+
+    let items = await collectItems(from: session, deadline: .seconds(12)) {
+      let vf = videoFrames($0)
+      return vf.count >= 3 && vf.contains { $0.isKeyframe }
+    }
+
+    let vf = videoFrames(items)
+    #expect(!vf.isEmpty, "expected at least one video frame over UDP")
+    #expect(vf.contains { $0.isKeyframe }, "expected a keyframe (IDR) over UDP")
+    let vpsAvailable = desc.video?.vps != nil || vf.contains { $0.vps != nil }
+    let spsAvailable = desc.video?.sps != nil || vf.contains { $0.sps != nil }
+    let ppsAvailable = desc.video?.pps != nil || vf.contains { $0.pps != nil }
+    #expect(vpsAvailable, "expected VPS via SDP or in-band")
+    #expect(spsAvailable, "expected SPS via SDP or in-band")
+    #expect(ppsAvailable, "expected PPS via SDP or in-band")
+  }
+
+  @Test("H.264 + AAC over UDP yields video and 48 kHz audio")
+  func h264AacOverUDP() async throws {
+    let watchdog = liveWatchdog(.seconds(45))
+    defer { watchdog.cancel() }
+    let fixture = LiveStreamFixture(ffmpegArgs: [
+      "-re",
+      "-f", "lavfi", "-i", "testsrc2=size=320x240:rate=15",
+      "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=48000",
+      "-map", "0:v", "-map", "1:a",
+      "-c:v", "libx264", "-preset", "ultrafast", "-tune", "zerolatency",
+      "-g", "15", "-pix_fmt", "yuv420p",
+      "-c:a", "aac", "-ar", "48000",
+    ])
+    defer { fixture.shutDown() }
+    try await fixture.start()
+
+    let (session, desc) = try await startSessionWithRetry(deadline: .seconds(20)) {
+      RTSPClientSession(url: fixture.rtspURL, transport: .udp)
+    }
+    #expect(desc.video?.codec == .h264)
+    #expect(desc.audio != nil, "expected an audio stream in the SDP")
+    #expect(desc.audio?.sampleRate == 48000)
+
+    // Video on one UDP socket pair, audio on another — both must demultiplex.
+    let items = await collectItems(from: session, deadline: .seconds(12)) {
+      !videoFrames($0).isEmpty && audioFrames($0).count >= 2
+    }
+
+    #expect(!videoFrames(items).isEmpty, "expected video frames over UDP")
+    let af = audioFrames(items)
+    #expect(!af.isEmpty, "expected audio frames over UDP")
+    #expect(af.allSatisfy { $0.sampleRate == 48000 }, "audio sample rate should be 48 kHz")
+
+    await session.stop()
+  }
 }
