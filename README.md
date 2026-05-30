@@ -6,7 +6,7 @@ A pure-Swift RTSP client library for streaming live video and audio from IP came
 - **Audio** — AAC, PCMU, PCMA, G.722, G.726, L16, G.723.1
 - **ONVIF analytics metadata** — raw XML documents from the camera's `application` RTSP stream
 - **Optional streams** — any combination of video / audio / metadata is supported; audio-only or metadata-only sessions (e.g. Axis `video=0`) work end-to-end
-- **TCP & UDP transport** — RTP/RTCP over RTSP-interleaved TCP or a dedicated UDP socket pair
+- **TCP & UDP transport** — RTP/RTCP over RTSP-interleaved TCP or a dedicated UDP socket pair, over IPv4 or IPv6
 - **Zero dependencies** — built only on Apple system frameworks (Foundation, Network, CryptoKit)
 - **Swift 6** — strict concurrency with async/await and AsyncThrowingStream
 
@@ -106,7 +106,7 @@ See [API.md](API.md) for the full API reference.
 - RTSP authentication (Basic and Digest with MD5)
 - Automatic session keepalive while streaming (GET_PARAMETER when the server
   advertises it, else OPTIONS) so long sessions aren't dropped at the timeout
-- Transport: TCP interleaved and UDP
+- Transport: TCP interleaved and UDP, over IPv4 or IPv6
 
 ### Compatibility
 - Tested with Reolink, Dahua, Hikvision, Longse, GW Security, VStarcam, Tenda, Foscam, and others
@@ -141,7 +141,7 @@ Sources/IPCamKit/
 
 ## Testing
 
-125+ tests across 17 suites covering RTSP parsing, SDP, RTP, H.264/H.265 depacketization, AAC, simple audio, ONVIF metadata depacketization, authentication, and the full pipeline:
+165+ tests across 18 suites covering RTSP parsing, SDP, RTP, H.264/H.265 depacketization, AAC, simple audio, ONVIF metadata depacketization, authentication, and the full pipeline:
 
 ```bash
 swift test
