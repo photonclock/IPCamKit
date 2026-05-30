@@ -9,6 +9,11 @@ on:
 jobs:
   build-and-test:
     name: Build & Test
+    # Run for pushes (post-merge to main) and for pull requests whose head
+    # branch lives in this repo. Pull requests from forks (foreign branches)
+    # have a different head repo and are skipped, so they never reach the
+    # macOS runner or install dependencies.
+    if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository
     runs-on: macos-15
     steps:
       - uses: actions/checkout@v4
@@ -29,6 +34,7 @@ jobs:
 
   lint:
     name: Lint
+    if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository
     runs-on: macos-15
     steps:
       - uses: actions/checkout@v4
