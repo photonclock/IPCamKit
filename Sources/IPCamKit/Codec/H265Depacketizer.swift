@@ -198,6 +198,12 @@ struct H265Depacketizer: Sendable {
 
     case 48:
       // Aggregation Packet (RFC 7798 section 4.4.2)
+      if accessUnit.inFU {
+        // An AP arriving mid-fragment would leave the in-progress FU NALEntry
+        // with its Int.max sentinel nextPieceIdx, which finalizeAccessUnit
+        // would then slice on and trap. Reject like the single-NAL branch.
+        return .failure(DepacketizeError("AP while fragment in progress"))
+      }
       var offset = payload.startIndex + 2  // skip outer NAL header
       guard offset < payload.endIndex else {
         return .failure(

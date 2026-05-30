@@ -458,6 +458,11 @@ private func skipH265HrdParameters(
       guard let n = reader.readExpGolomb() else {
         throw RTSPError.depacketizationError("SPS: can't read nb_cpb")
       }
+      // cpb_cnt_minus1 is in [0, 31] per H.265; reject larger values so the
+      // CPB loops below can't spin and `n + 1` can't overflow UInt32.
+      guard n <= 31 else {
+        throw RTSPError.depacketizationError("cpb_cnt_minus1 must be in [0, 31]")
+      }
       nbCpb = n + 1
     }
     if nalParamsPresent {
@@ -764,6 +769,11 @@ func parseH265SPS(_ rbsp: Data) throws -> H265Sps {
   if let longTermPresent = reader.readBool(), longTermPresent {
     guard let numLongTermRefPics = reader.readExpGolomb() else {
       throw RTSPError.depacketizationError("SPS: can't read num_long_term_ref_pics_sps")
+    }
+    // num_long_term_ref_pics_sps is in [0, 32] per H.265; reject larger values
+    // so a bogus count can't spin the loop (reader.skip is unchecked).
+    guard numLongTermRefPics <= 32 else {
+      throw RTSPError.depacketizationError("num_long_term_ref_pics_sps must be in [0, 32]")
     }
     for _ in 0..<numLongTermRefPics {
       reader.skip(Int(log2MaxPicOrderCntLsbMinus4) + 4)  // lt_ref_pic_poc_lsb_sps
