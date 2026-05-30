@@ -376,7 +376,7 @@ actor SessionState {
     guard let urlComponents = URLComponents(string: url) else {
       throw RTSPError.connectionFailed("Invalid URL: \(url)")
     }
-    let host = urlComponents.host ?? "localhost"
+    let host = unbracketedHost(urlComponents.host ?? "localhost")
     let rawPort = urlComponents.port ?? 554
     guard let port = UInt16(exactly: rawPort) else {
       throw RTSPError.connectionFailed("Invalid port \(rawPort) in URL: \(url)")
@@ -1381,6 +1381,21 @@ actor SessionState {
     default: return .other(encoding)
     }
   }
+}
+
+// MARK: - URL helpers (free functions, testable)
+
+/// Strip the surrounding brackets from an IPv6 literal URL host.
+///
+/// Foundation's URL parser surfaces a bracketed IPv6 host verbatim
+/// (`rtsp://[::1]:554/…` → `[::1]`), but `NWEndpoint.Host` expects the bare
+/// address (e.g. `::1`, or `fe80::1%en0` with a zone id) and rejects the
+/// bracketed form. A non-bracketed host (IPv4 / hostname) is returned unchanged.
+func unbracketedHost(_ host: String) -> String {
+  guard host.hasPrefix("["), host.hasSuffix("]"), host.count >= 2 else {
+    return host
+  }
+  return String(host.dropFirst().dropLast())
 }
 
 // MARK: - Encoding-support predicates (free functions, testable)
