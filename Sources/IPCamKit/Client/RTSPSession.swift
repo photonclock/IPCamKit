@@ -570,6 +570,19 @@ actor SessionState {
             clockRate: stream.clockRateHz,
             formatSpecificParams: stream.formatSpecificParams))
       }
+      // If the SDP advertised parameter sets (sprop-*) but the depacketizer
+      // couldn't parse them, it silently falls back to in-band parameters;
+      // surface that, since the first decodable frame may be delayed.
+      if let fmtp = stream.formatSpecificParams,
+        fmtp.lowercased().contains("sprop"),
+        depacketizer?.videoParameters == nil
+      {
+        onDiagnostic?(
+          RTSPDiagnostic(
+            severity: .warning,
+            message: "Video fmtp advertised sprop parameter sets but they could not be "
+              + "parsed; falling back to in-band parameters."))
+      }
       videoClockRate = stream.clockRateHz
 
       var videoStart: UInt32?

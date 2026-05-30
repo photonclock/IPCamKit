@@ -516,6 +516,67 @@ struct LiveIntegrationTests {
     await session.stop()
   }
 
+  @Test("A second concurrent frames() consumer is rejected (finding #12)")
+  func framesRejectsSecondConsumer() async throws {
+    let watchdog = liveWatchdog(.seconds(45))
+    defer { watchdog.cancel() }
+    let fixture = LiveStreamFixture(
+      transports: ["tcp"],
+      ffmpegArgs: [
+        "-re", "-f", "lavfi", "-i", "testsrc2=size=320x240:rate=15",
+        "-c:v", "libx264", "-preset", "ultrafast", "-tune", "zerolatency",
+        "-g", "15", "-pix_fmt", "yuv420p", "-an",
+      ])
+    defer { fixture.shutDown() }
+    try await fixture.start()
+
+    let (session, _) = try await startSessionWithRetry(deadline: .seconds(20)) {
+      RTSPClientSession(url: fixture.rtspURL, transport: .tcp)
+    }
+
+    // Consumer 1 owns the stream; it flips the single-consumer guard once its
+    // reader loop is running.
+    let sink = ItemSink()
+    let consumer1 = Task {
+      do {
+        for try await item in session.frames() {
+          await sink.add(item)
+        }
+      } catch {
+        await sink.finish(error)
+      }
+    }
+    defer { consumer1.cancel() }
+
+    // Wait until consumer 1 is actually streaming: a delivered item proves the
+    // reader loop is past the guard, so isStreaming is set.
+    let endBy = ContinuousClock.now + .seconds(12)
+    while ContinuousClock.now < endBy {
+      if !(await sink.items).isEmpty { break }
+      try? await Task.sleep(for: .milliseconds(120))
+    }
+    #expect(!(await sink.items).isEmpty, "consumer 1 should be receiving frames")
+
+    // A second concurrent frames() must be rejected with .invalidState and
+    // deliver nothing.
+    var secondError: Error?
+    do {
+      for try await _ in session.frames() {
+        Issue.record("second frames() must not deliver any item")
+        break
+      }
+    } catch {
+      secondError = error
+    }
+    if let rtspError = secondError as? RTSPError, case .invalidState = rtspError {
+      // expected
+    } else {
+      Issue.record("expected RTSPError.invalidState, got \(String(describing: secondError))")
+    }
+
+    await session.stop()
+  }
+
   @Test("H.265 over interleaved TCP yields a keyframe with in-band VPS/SPS/PPS")
   func h265OverTCP() async throws {
     let watchdog = liveWatchdog(.seconds(45))
