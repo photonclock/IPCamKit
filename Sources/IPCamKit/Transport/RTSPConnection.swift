@@ -19,28 +19,62 @@ actor RTSPTransportConnection {
   private var readBuffer = Data()
   private var connectionContext: ConnectionContext?
 
+  /// Maximum time to wait for the TCP connection to become ready. NWConnection
+  /// has no built-in connect deadline, so a half-open server would otherwise
+  /// hang `connect()` forever.
+  private let connectTimeoutSeconds: Double = 15
+
+  /// One-shot guard so the connect continuation resumes exactly once across the
+  /// state handler and the timeout. Both run on the serial `queue`, so plain
+  /// access is race-free (hence `@unchecked Sendable`).
+  private final class ConnectGuard: @unchecked Sendable {
+    var settled = false
+  }
+
   /// Connect to an RTSP server.
   func connect(host: String, port: UInt16) async throws {
     let nwHost = NWEndpoint.Host(host)
-    let nwPort = NWEndpoint.Port(rawValue: port)!
+    guard let nwPort = NWEndpoint.Port(rawValue: port) else {
+      throw RTSPError.connectionFailed("Invalid port \(port)")
+    }
     let conn = NWConnection(host: nwHost, port: nwPort, using: .tcp)
 
     self.connection = conn
 
-    try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
-      conn.stateUpdateHandler = { state in
-        switch state {
-        case .ready:
-          continuation.resume()
-        case .failed(let error):
-          continuation.resume(throwing: RTSPError.connectionFailed(error.localizedDescription))
-        case .cancelled:
-          continuation.resume(throwing: RTSPError.unexpectedDisconnection)
-        default:
-          break
+    let guardState = ConnectGuard()
+    let timeout = connectTimeoutSeconds
+    do {
+      try await withCheckedThrowingContinuation {
+        (continuation: CheckedContinuation<Void, Error>) in
+        // Resume exactly once; only ever called on the serial `queue`.
+        @Sendable func settle(_ result: Result<Void, Error>) {
+          guard !guardState.settled else { return }
+          guardState.settled = true
+          continuation.resume(with: result)
         }
+        conn.stateUpdateHandler = { state in
+          switch state {
+          case .ready:
+            settle(.success(()))
+          case .failed(let error):
+            settle(.failure(RTSPError.connectionFailed(error.localizedDescription)))
+          case .cancelled:
+            settle(.failure(RTSPError.unexpectedDisconnection))
+          default:
+            break
+          }
+        }
+        queue.asyncAfter(deadline: .now() + timeout) {
+          settle(.failure(RTSPError.timeout))
+        }
+        conn.start(queue: queue)
       }
-      conn.start(queue: queue)
+    } catch {
+      // On timeout/failure, tear down the half-open socket. A late `.cancelled`
+      // from this is ignored by the already-settled guard.
+      conn.cancel()
+      connection = nil
+      throw error
     }
 
     // Clear the state handler after connection
