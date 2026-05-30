@@ -892,8 +892,8 @@ actor SessionState {
       request.setHeader("Session", value: sid)
     }
 
-    if let auth = authenticator, auth.hasChallenge {
-      if let authHeader = auth.authorize(method: method.rawValue, uri: url) {
+    if authenticator?.hasChallenge == true {
+      if let authHeader = authenticator!.authorize(method: method.rawValue, uri: url) {
         request.setHeader("Authorization", value: authHeader)
       }
     }
@@ -910,13 +910,14 @@ actor SessionState {
         let wwwAuth = resp.header("WWW-Authenticate")
       {
         auth.handleChallenge(wwwAuth)
-        authenticator = auth
 
         var retryRequest = RTSPRequest(method: method, url: url)
         retryRequest.setHeader("CSeq", value: "\(nextCSeq())")
         if let authHeader = auth.authorize(method: method.rawValue, uri: url) {
           retryRequest.setHeader("Authorization", value: authHeader)
         }
+        // Persist after authorize so the advanced nonce-count survives.
+        authenticator = auth
         for (name, value) in extraHeaders {
           retryRequest.setHeader(name, value: value)
         }
