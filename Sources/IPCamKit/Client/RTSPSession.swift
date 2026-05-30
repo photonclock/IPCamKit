@@ -7,9 +7,12 @@ import Network
 
 /// Transport mode for RTP data.
 public enum Transport: Sendable {
-  /// RTP interleaved over RTSP TCP connection.
+  /// RTP interleaved over the RTSP TCP connection.
   case tcp
   /// RTP/RTCP on separate UDP ports.
+  ///
+  /// - Warning: Not implemented. `start()` throws when this is selected.
+  @available(*, deprecated, message: "UDP transport is not implemented; use .tcp")
   case udp
 }
 
@@ -305,6 +308,17 @@ actor SessionState {
     onDiagnostic: (@Sendable (RTSPDiagnostic) -> Void)?
   ) async throws -> SessionDescription {
     self.onDiagnostic = onDiagnostic
+
+    // UDP transport is not implemented: there is no socket pair, no
+    // client_port negotiation, and the receive loop only reads TCP-interleaved
+    // data — a UDP session would PLAY and then hang forever. Fail fast and
+    // clearly rather than appear to connect and deliver nothing.
+    guard transport == .tcp else {
+      throw RTSPError.sessionSetupFailed(
+        statusCode: 0,
+        reason: "UDP transport is not supported by IPCamKit; use Transport.tcp")
+    }
+
     // Parse URL
     guard let urlComponents = URLComponents(string: url) else {
       throw RTSPError.connectionFailed("Invalid URL: \(url)")

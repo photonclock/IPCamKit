@@ -18,7 +18,6 @@ actor RTSPTransportConnection {
   private let parser = RTSPParser()
   private var readBuffer = Data()
   private var connectionContext: ConnectionContext?
-  private var readPos: UInt64 = 0
 
   /// Connect to an RTSP server.
   func connect(host: String, port: UInt16) async throws {
@@ -93,9 +92,8 @@ actor RTSPTransportConnection {
     while true {
       // Try to parse from existing buffer
       var bufferCopy = readBuffer
-      if let (msg, consumed) = try parser.parse(&bufferCopy) {
+      if let (msg, _) = try parser.parse(&bufferCopy) {
         readBuffer = bufferCopy
-        readPos += UInt64(consumed)
         return msg
       }
 

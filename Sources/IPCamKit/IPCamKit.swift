@@ -4,7 +4,7 @@
 // Public API:
 // - RTSPClientSession: main entry point for connecting to RTSP cameras
 // - Credentials: username/password for RTSP authentication
-// - Transport: .tcp (interleaved) or .udp
+// - Transport: .tcp (RTP interleaved over the RTSP connection)
 // - SessionDescription: codec info returned from start()
 // - PublicVideoFrame: depacketized video frame with AVCC NAL units
 // - PublicAudioFrame: depacketized audio frame
