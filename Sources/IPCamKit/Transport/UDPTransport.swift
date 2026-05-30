@@ -213,6 +213,11 @@ final class UDPPair: @unchecked Sendable {
   /// and lets `holePunch()`/sends omit the address. `peerHost` must be a numeric
   /// literal of this pair's address family (or a name `NWEndpoint` can resolve);
   /// IPv4 and IPv6 (including link-local zone ids) are both supported.
+  ///
+  /// Known limitation: `establish()` is not Task-cancellation-aware, so a
+  /// cancellation while connecting is observed only when the per-flow connect
+  /// times out (`connectTimeoutSeconds`), not immediately; the `catch` here then
+  /// cancels the already-established RTP flow, so nothing leaks past that point.
   func connect(peerHost: String, peerRTPPort: UInt16) async throws {
     guard peerRTPPort < UInt16.max else {
       throw RTSPError.transportNegotiationFailed

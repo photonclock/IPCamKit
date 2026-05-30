@@ -99,11 +99,15 @@ public struct SessionDescription: Sendable {
 /// ```swift
 /// let session = RTSPClientSession(url: "rtsp://host:554/stream")
 /// let desc = try await session.start()
-/// for try await frame in session.videoFrames() {
-///     // Process frame.nalus
+/// for try await item in session.frames() {
+///     switch item {
+///     case .video(let frame): _ = frame.nalus  // AVCC NAL units
+///     case .audio, .metadata, .rtcp: break
+///     }
 /// }
 /// await session.stop()
 /// ```
+/// `frames()` may be consumed only once per session.
 public final class RTSPClientSession: Sendable {
   private let url: String
   private let credentials: Credentials?
@@ -211,7 +215,10 @@ public struct PublicAudioFrame: Sendable {
   /// Channel count, if known.
   public let channels: UInt16?
 
-  /// Number of RTP packets lost before this frame.
+  /// RTP packets lost before this frame: the forward gap in the RTP sequence
+  /// number. May be large (or spurious) if a camera's packetizer emits a wildly
+  /// forward-jumped sequence number, so treat it as a discontinuity indicator
+  /// rather than an exact loss count.
   public let loss: UInt16
 }
 
@@ -228,7 +235,10 @@ public struct PublicMetadataFrame: Sendable {
   /// SDP encoding name (e.g. `vnd.onvif.metadata`).
   public let encodingName: String
 
-  /// Number of RTP packets lost before this frame.
+  /// RTP packets lost before this frame: the forward gap in the RTP sequence
+  /// number. May be large (or spurious) if a camera's packetizer emits a wildly
+  /// forward-jumped sequence number, so treat it as a discontinuity indicator
+  /// rather than an exact loss count.
   public let loss: UInt16
 }
 
@@ -243,7 +253,10 @@ public struct PublicVideoFrame: Sendable {
   /// Whether this is a keyframe (IDR).
   public let isKeyframe: Bool
 
-  /// Number of RTP packets lost before this frame.
+  /// RTP packets lost before this frame: the forward gap in the RTP sequence
+  /// number. May be large (or spurious) if a camera's packetizer emits a wildly
+  /// forward-jumped sequence number, so treat it as a discontinuity indicator
+  /// rather than an exact loss count.
   public let loss: UInt16
 
   /// SPS data if parameters changed with this frame.

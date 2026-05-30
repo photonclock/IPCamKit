@@ -192,6 +192,12 @@ actor RTSPTransportConnection {
   }
 
   /// Read raw data from the connection.
+  ///
+  /// Known limitation: there is no per-read idle timeout. A peer that goes
+  /// silent after setup leaves this parked until `close()` (via `stop()`) is
+  /// called or the keepalive detects the dead session. An idle timeout is
+  /// deliberately omitted — sizing it without killing legitimately bursty /
+  /// low-FPS streams is unsafe — so liveness is the keepalive/stop() contract.
   private func readData() async throws -> Data {
     guard let conn = connection else {
       throw RTSPError.unexpectedDisconnection

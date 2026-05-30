@@ -13,7 +13,11 @@ import Foundation
 /// Recovery semantics:
 /// - Loss mid-document discards the buffered prefix and drops the rest of
 ///   that document (until the next marker). The loss surfaces on the next
-///   clean frame.
+///   clean frame. Edge case: if the very next packet after the loss is itself a
+///   complete single-packet document with the marker set, it is consumed as the
+///   abandoned document's terminator and dropped too — RTP gives no way to tell
+///   it apart from the loss-damaged document's tail. At most one extra document
+///   is lost this way; the loss count is still carried forward.
 /// - Buffer overflow (oversized document) discards the prefix, fires a
 ///   `warning` diagnostic, and drops the rest of that document until the
 ///   next marker — same as the loss case. The next document emits normally.

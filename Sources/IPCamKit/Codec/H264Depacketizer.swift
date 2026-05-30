@@ -139,6 +139,12 @@ struct H264Depacketizer: Sendable {
     pendingBytes += piece.count
   }
 
+  /// Returns the next completed item, or nil when none are buffered.
+  ///
+  /// Contract: callers MUST drain `pull()` to nil after each `push()` (as
+  /// RTSPSession does). The internal `pending` buffer is unbounded; not draining
+  /// lets it grow without limit. This type is module-internal with a single
+  /// driver that upholds the invariant.
   mutating func pull() -> Result<CodecItem, DepacketizeError>? {
     guard !pending.isEmpty else { return nil }
     let item = pending.removeFirst()
