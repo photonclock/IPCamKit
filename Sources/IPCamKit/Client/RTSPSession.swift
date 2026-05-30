@@ -363,24 +363,8 @@ actor SessionState {
 
     if let videoIdx = videoIdx {
       let stream = presMut.streams[videoIdx]
-      let setupURL = stream.control ?? url
-      var setupHeaders: [(String, String)] = []
-      if transport == .tcp {
-        let channelId = channelMappings.nextUnassigned() ?? 0
-        setupHeaders.append(
-          (
-            "Transport",
-            "RTP/AVP/TCP;unicast;interleaved=\(channelId)-\(channelId + 1)"
-          ))
-        try channelMappings.assign(channelId: channelId, streamIndex: videoIdx)
-      } else {
-        setupHeaders.append(("Transport", "RTP/AVP;unicast"))
-      }
-
-      let setupResp = try await sendRequest(
-        method: .setup, url: setupURL, extraHeaders: setupHeaders)
-      let setup = try parseSetup(response: setupResp)
-      sessionId = setup.session.id
+      let setup = try await setupStreamTCP(
+        controlURL: stream.control ?? url, streamIndex: videoIdx)
       videoSetupSSRC = setup.ssrc
       presMut.streams[videoIdx].state = .setup(
         StreamStateInit(ssrc: setup.ssrc, initialSeq: nil, initialRtptime: nil, ctx: .dummy))
@@ -395,36 +379,8 @@ actor SessionState {
 
     if let audioIdx = audioIdx {
       let audioStream = presMut.streams[audioIdx]
-      let audioSetupURL = audioStream.control ?? url
-      var audioSetupHeaders: [(String, String)] = []
-      if transport == .tcp {
-        let audioChannelId = channelMappings.nextUnassigned() ?? 2
-        audioSetupHeaders.append(
-          (
-            "Transport",
-            "RTP/AVP/TCP;unicast;interleaved=\(audioChannelId)-\(audioChannelId + 1)"
-          ))
-        try channelMappings.assign(
-          channelId: audioChannelId, streamIndex: audioIdx)
-      } else {
-        audioSetupHeaders.append(("Transport", "RTP/AVP;unicast"))
-      }
-      if let sid = sessionId {
-        audioSetupHeaders.append(("Session", sid))
-      }
-      let audioSetupResp = try await sendRequest(
-        method: .setup, url: audioSetupURL,
-        extraHeaders: audioSetupHeaders)
-      let audioSetup = try parseSetup(response: audioSetupResp)
-      if let prev = sessionId, prev != audioSetup.session.id {
-        onDiagnostic?(
-          RTSPDiagnostic(
-            severity: .warning,
-            message:
-              "Camera issued a new Session ID at audio SETUP "
-              + "(\(prev) -> \(audioSetup.session.id)); rolling forward."))
-      }
-      sessionId = audioSetup.session.id
+      let audioSetup = try await setupStreamTCP(
+        controlURL: audioStream.control ?? url, streamIndex: audioIdx)
       audioSetupSSRC = audioSetup.ssrc
       presMut.streams[audioIdx].state = .setup(
         StreamStateInit(ssrc: audioSetup.ssrc, initialSeq: nil, initialRtptime: nil, ctx: .dummy))
@@ -446,38 +402,9 @@ actor SessionState {
 
     if let idx = applicationIdx {
       let applicationStream = presMut.streams[idx]
-      let applicationSetupURL = applicationStream.control ?? url
-      var applicationSetupHeaders: [(String, String)] = []
-      if transport == .tcp {
-        let applicationChannelId = channelMappings.nextUnassigned() ?? 4
-        applicationSetupHeaders.append(
-          (
-            "Transport",
-            "RTP/AVP/TCP;unicast;interleaved=\(applicationChannelId)-\(applicationChannelId + 1)"
-          ))
-        try channelMappings.assign(
-          channelId: applicationChannelId, streamIndex: idx)
-      } else {
-        applicationSetupHeaders.append(("Transport", "RTP/AVP;unicast"))
-      }
-      if let sid = sessionId {
-        applicationSetupHeaders.append(("Session", sid))
-      }
-
       do {
-        let applicationSetupResp = try await sendRequest(
-          method: .setup, url: applicationSetupURL,
-          extraHeaders: applicationSetupHeaders)
-        let applicationSetup = try parseSetup(response: applicationSetupResp)
-        if let prev = sessionId, prev != applicationSetup.session.id {
-          onDiagnostic?(
-            RTSPDiagnostic(
-              severity: .warning,
-              message:
-                "Camera issued a new Session ID at application SETUP "
-                + "(\(prev) -> \(applicationSetup.session.id)); rolling forward."))
-        }
-        sessionId = applicationSetup.session.id
+        let applicationSetup = try await setupStreamTCP(
+          controlURL: applicationStream.control ?? url, streamIndex: idx)
         applicationSetupSSRC = applicationSetup.ssrc
         presMut.streams[idx].state = .setup(
           StreamStateInit(
@@ -947,6 +874,48 @@ actor SessionState {
   private func nextCSeq() -> UInt32 {
     cseq += 1
     return cseq
+  }
+
+  /// SETUP one stream over TCP-interleaved transport, assign its channel pair,
+  /// and roll the session id forward. We request the next free even channel,
+  /// but adopt the server's interleaved channel when it renumbers to a
+  /// different free even channel so routing matches where the data actually
+  /// arrives (the `Session` header is added by `sendRequest`). Returns the
+  /// parsed SETUP response.
+  private func setupStreamTCP(
+    controlURL: String, streamIndex: Int
+  ) async throws -> SetupResponse {
+    let requested = channelMappings.nextUnassigned() ?? 0
+    let headers = [
+      (
+        "Transport",
+        "RTP/AVP/TCP;unicast;interleaved=\(requested)-\(Int(requested) + 1)"
+      )
+    ]
+    let resp = try await sendRequest(
+      method: .setup, url: controlURL, extraHeaders: headers)
+    let setup = try parseSetup(response: resp)
+
+    if let prev = sessionId, prev != setup.session.id {
+      onDiagnostic?(
+        RTSPDiagnostic(
+          severity: .warning,
+          message:
+            "Camera issued a new Session ID at SETUP "
+            + "(\(prev) -> \(setup.session.id)); rolling forward."))
+    }
+    sessionId = setup.session.id
+
+    let channel: UInt8
+    if let server = setup.channelId, server % 2 == 0,
+      channelMappings.lookup(server) == nil
+    {
+      channel = server
+    } else {
+      channel = requested
+    }
+    try channelMappings.assign(channelId: channel, streamIndex: streamIndex)
+    return setup
   }
 
   private func convertFrame(
