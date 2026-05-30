@@ -6,12 +6,13 @@ A pure-Swift RTSP client library for streaming live video and audio from IP came
 - **Audio** — AAC, PCMU, PCMA, G.722, G.726, L16, G.723.1
 - **ONVIF analytics metadata** — raw XML documents from the camera's `application` RTSP stream
 - **Optional streams** — any combination of video / audio / metadata is supported; audio-only or metadata-only sessions (e.g. Axis `video=0`) work end-to-end
-- **Zero dependencies** — only Foundation, Network, and CryptoKit
+- **TCP & UDP transport** — RTP/RTCP over RTSP-interleaved TCP or a dedicated UDP socket pair
+- **Zero dependencies** — built only on Apple system frameworks (Foundation, Network, CryptoKit)
 - **Swift 6** — strict concurrency with async/await and AsyncThrowingStream
 
 ## Requirements
 
-- macOS 14.0+
+- macOS 13.0+, iOS 16.0+, tvOS 16.0+, Mac Catalyst 16.0+, visionOS 1.0+
 - Swift 6.0+
 
 ## Installation
@@ -20,7 +21,7 @@ Add IPCamKit as a dependency in your `Package.swift`:
 
 ```swift
 dependencies: [
-    .package(url: "https://github.com/steelbrain/IPCamKit.git", from: "0.1.1"),
+    .package(url: "https://github.com/steelbrain/IPCamKit.git", from: "0.2.0"),
 ]
 ```
 
@@ -134,13 +135,13 @@ Sources/IPCamKit/
 ├── RTP/            RTP/RTCP packets, Timeline, ChannelMapping, InorderParser
 ├── Codec/          H.264/H.265 depacketizers, NAL/SPS/PPS parsing, audio + metadata depacketizers
 ├── Auth/           Basic and Digest authentication
-├── Transport/      NWConnection RTSP/TCP control + bound BSD socket pair for UDP RTP/RTCP
+├── Transport/      Network-framework RTSP/TCP control + UDP RTP/RTCP socket pair (IPv4/IPv6)
 └── Client/         RTSP session, DESCRIBE/SETUP/PLAY parsers, Presentation
 ```
 
 ## Testing
 
-120+ tests across 17 suites covering RTSP parsing, SDP, RTP, H.264/H.265 depacketization, AAC, simple audio, ONVIF metadata depacketization, authentication, and the full pipeline:
+125+ tests across 17 suites covering RTSP parsing, SDP, RTP, H.264/H.265 depacketization, AAC, simple audio, ONVIF metadata depacketization, authentication, and the full pipeline:
 
 ```bash
 swift test
@@ -148,8 +149,8 @@ swift test
 
 The **live integration suite** drives the real `RTSPClientSession` end to end: `ffmpeg`
 publishes a synthetic H.264/H.265/AAC stream to a [mediamtx](https://github.com/bluenviron/mediamtx)
-RTSP server, and the client pulls it back over RTSP-interleaved TCP. Both tools must be on
-`PATH`:
+RTSP server, and the client pulls it back over both RTSP-interleaved TCP and UDP. Both tools
+must be on `PATH`:
 
 ```bash
 brew install ffmpeg mediamtx

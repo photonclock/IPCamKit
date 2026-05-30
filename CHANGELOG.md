@@ -9,14 +9,28 @@
 ### New
 
 - ONVIF analytics metadata stream support (`vnd.onvif.metadata` per the ONVIF Streaming Specification). Surfaced as `PublicCodecItem.metadata(PublicMetadataFrame)` in the `session.frames()` stream, with discoverability via `SessionDescription.metadataEncoding`. Best-effort: malformed metadata SDP or a failed application SETUP degrades to a diagnostic without aborting video/audio.
+- Real UDP transport for RTP/RTCP. Selecting `Transport.udp` now streams end-to-end over a bound BSD socket pair (RTP and RTCP on adjacent ports), replacing the earlier non-functional scaffolding.
+- Automatic RTSP session keepalive while streaming: sends `GET_PARAMETER` when the server advertises support, otherwise `OPTIONS`, at roughly half the negotiated session timeout, so long-running sessions aren't dropped by the camera. Each round-trip is reported via `onDiagnostic` at `.info` severity.
 
 ### Improvements
 
 - Add visionOS 1.0 to supported platforms
+- Add a connect timeout to the RTSP TCP transport so an unreachable or dead camera fails fast instead of hanging.
+- Live integration test suite: drives `RTSPClientSession` end-to-end against an `ffmpeg`-published stream relayed by `mediamtx`, exercising H.264/H.265/AAC over both RTSP-interleaved TCP and UDP. CI installs `ffmpeg` and `mediamtx`.
 
 ### Fixes
 
 - Audio depacketizer init failures now null out the audio stream state (index, encoding name, clock rate, channels), mirroring the metadata-init failure path. Previously the indices stayed set while the depacketizer was nil; packets on that channel were silently dropped by the dispatch loop but `SessionDescription` could still claim the stream existed. Required to keep the "at least one usable stream" guard honest in audio-only sessions.
+- Strengthen RTSP Digest authentication.
+- Harden the H.265 depacketizer and parameter-set parsing against malformed input.
+- Fix and harden H.264 SPS parsing.
+- Harden RTP packet and context handling, and saturate loss counters to avoid overflow traps.
+- Harden the RTSP parsers against malformed server input, and harden the session start path.
+- Fix the static L16 payload clock rate to 44100 Hz.
+- Ignore the RTP MARK bit on H.264 SEI packets (some cameras set it on a trailing SEI, splitting the access unit early).
+- Tolerate a complete (un-fragmented) NAL that arrives inside an FU wrapper instead of erroring.
+- Accept a scheme-less `Content-Base` header by resolving it against the request URL.
+- Normalize audio frame data to a standalone `Data`.
 
 ## 0.2.0
 
