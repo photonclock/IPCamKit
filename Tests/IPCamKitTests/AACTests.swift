@@ -48,6 +48,38 @@ struct AACTests {
     #expect(rfc3640.parameters.rfc6381Codec == "mp4a.40.2")
   }
 
+  @Test("AAC trusts the ASC over an rtpmap channel mismatch (#5)")
+  func aacChannelMismatchTrustsASC() throws {
+    // config=1188 is mono; an rtpmap claiming stereo must NOT reject the stream.
+    let d = try AACDepacketizer(clockRate: 48_000, channels: 2, formatSpecificParams: aacFmtp)
+    #expect(d.parameters.clockRate == 48_000)
+  }
+
+  @Test("AAC accepts an RTP clock that is a small multiple of the ASC rate (#6)")
+  func aacClockRateMultiple() throws {
+    // config=1308 encodes AOT2 / 24000 Hz / mono; HE-AAC commonly doubles the
+    // RTP clock, so 48000 (= 2x) must be accepted.
+    let heFmtp =
+      "streamtype=5;profile-level-id=1;mode=AAC-hbr;sizelength=13;"
+      + "indexlength=3;indexdeltalength=3;config=1308"
+    _ = try AACDepacketizer(clockRate: 48_000, channels: nil, formatSpecificParams: heFmtp)
+    // A genuinely unrelated rate (44100 vs 24000) is still rejected.
+    #expect(throws: DepacketizeError.self) {
+      _ = try AACDepacketizer(clockRate: 44_100, channels: nil, formatSpecificParams: heFmtp)
+    }
+  }
+
+  @Test("AAC rejects an AU-headers-length that isn't a multiple of 16 (#17)")
+  func aacAuHeadersLengthMultipleOf16() throws {
+    var d = try AACDepacketizer(clockRate: 48_000, channels: nil, formatSpecificParams: aacFmtp)
+    // 24 bits is divisible by 8 but not 16: the old guard accepted it and
+    // truncated to one header (misparse); the tightened guard rejects it.
+    let payload = Data([0x00, 0x18]) + Data(repeating: 0, count: 10)
+    #expect(throws: DepacketizeError.self) {
+      try d.push(makeAACPacket(seq: 0, mark: true, payload: payload))
+    }
+  }
+
   // MARK: - Depacketizer Tests
 
   @Test("Depacketize happy path: single, aggregate, fragment")

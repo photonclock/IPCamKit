@@ -89,21 +89,10 @@ extension AudioSpecificConfig {
       throw DepacketizeError(
         "reserved channelConfiguration 0x\(String(channelsConfigId, radix: 16))")
     }
+    // channelConfiguration 0 ("defined in AOT-related config") maps to nil here,
+    // so this unwrap already rejects it — no separate `> 0` guard needed.
     guard let channels = channelConfigs[Int(channelsConfigId)] else {
       throw DepacketizeError("program_config_element parsing unimplemented")
-    }
-    guard channelsConfigId > 0 else {
-      throw DepacketizeError("program_config_element parsing unimplemented")
-    }
-
-    // SBR/PS extensions
-    if audioObjectType == 5 || audioObjectType == 29 {
-      if let extFreqIdx = r.readBits(4), extFreqIdx == 0xf {
-        r.skip(24)
-      }
-      if let secondAot = r.readBits(5), secondAot == 22 {
-        r.skip(4)
-      }
     }
 
     // Validate supported audio object types (ones using GASpecificConfig)
@@ -202,10 +191,16 @@ func parseAACFormatSpecificParams(
 
   let parsed = try AudioSpecificConfig.parse(configData)
 
-  guard clockRate == parsed.parameters.clockRate else {
-    throw DepacketizeError(
-      "Expected RTP clock rate \(clockRate) and AAC sampling frequency \(parsed.parameters.clockRate) to match"
-    )
+  // HE-AAC / AAC+SBR commonly signals an RTP clock rate that is a small integer
+  // multiple of the core ASC sampling frequency (e.g. RTP 44100 with a 22050
+  // core). Accept an exact match or a small multiple; reject an unrelated one.
+  let ascRate = parsed.parameters.clockRate
+  if clockRate != ascRate {
+    guard ascRate > 0, clockRate % ascRate == 0, clockRate / ascRate <= 4 else {
+      throw DepacketizeError(
+        "RTP clock rate \(clockRate) is not a small integer multiple of "
+          + "AAC sampling frequency \(ascRate)")
+    }
   }
 
   return parsed
