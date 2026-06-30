@@ -26,6 +26,11 @@ struct RTSPAuthenticator: Sendable {
   /// Set once the server has offered Basic, so later requests can attach it
   /// pre-emptively instead of paying a fresh 401 round-trip every time.
   private var basicChallengeSeen = false
+  /// Some embedded cameras advertise Digest but reject valid Digest responses.
+  /// If Basic was also offered and succeeds as a fallback, keep using Basic for
+  /// the rest of the session instead of rediscovering the broken Digest path on
+  /// every RTSP request.
+  private var forceBasic = false
 
   init(credentials: Credentials) {
     self.credentials = credentials
@@ -43,6 +48,7 @@ struct RTSPAuthenticator: Sendable {
       // A usable challenge replaces any prior one, resetting nc (nc starts 0).
       if !state.nonce.isEmpty {
         digestState = state
+        forceBasic = false
       }
     } else if lower.hasPrefix("basic") {
       basicChallengeSeen = true
@@ -54,16 +60,31 @@ struct RTSPAuthenticator: Sendable {
   /// Mutates internal state: Digest+qop advances the nonce-count so each
   /// authorized request carries a unique, monotonically increasing `nc`.
   mutating func authorize(method: String, uri: String) -> String? {
-    if digestState != nil {
+    if digestState != nil && !forceBasic {
       return generateDigestAuth(method: method, uri: uri)
     }
     // Fall back to Basic auth
     return generateBasicAuth()
   }
 
+  /// Generate a Basic Authorization header and prefer Basic on future requests.
+  ///
+  /// Used only after a server has offered Basic and rejected Digest. Calling this
+  /// without a Basic challenge would silently weaken auth selection, so it
+  /// returns nil unless Basic was actually advertised.
+  mutating func authorizeBasicFallback() -> String? {
+    guard basicChallengeSeen else { return nil }
+    forceBasic = true
+    return generateBasicAuth()
+  }
+
   /// Whether we have received a challenge and can generate auth headers.
   var hasChallenge: Bool {
     digestState != nil || basicChallengeSeen
+  }
+
+  var hasBasicChallenge: Bool {
+    basicChallengeSeen
   }
 
   // MARK: - Basic Auth

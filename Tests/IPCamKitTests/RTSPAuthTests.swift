@@ -138,6 +138,17 @@ struct RTSPAuthTests {
     #expect(header?.hasPrefix("Basic ") == true)
   }
 
+  @Test("Basic fallback overrides a broken Digest challenge")
+  func basicFallbackOverridesDigest() {
+    var auth = RTSPAuthenticator(credentials: Credentials(username: "u", password: "p"))
+    auth.handleChallenge("Basic realm=\"cam\"")
+    auth.handleChallenge("Digest realm=\"cam\", nonce=\"abc123\"")
+
+    #expect(auth.authorize(method: "DESCRIBE", uri: "rtsp://h/p")?.hasPrefix("Digest ") == true)
+    #expect(auth.authorizeBasicFallback()?.hasPrefix("Basic ") == true)
+    #expect(auth.authorize(method: "SETUP", uri: "rtsp://h/track1")?.hasPrefix("Basic ") == true)
+  }
+
   @Test("Digest quoted-string fields are escaped (finding #38)")
   func digestEscapesQuotedFields() {
     var auth = RTSPAuthenticator(

@@ -1326,6 +1326,13 @@ actor SessionState {
           authenticator = auth
           let retryResp = try await conn.sendRequest(retryRequest)
           if retryResp.statusCode == 401 {
+            if auth.hasBasicChallenge,
+              let basicResp = try await retryWithBasicFallback(
+                auth: &auth, method: method, url: url, extraHeaders: extraHeaders)
+            {
+              authenticator = auth
+              return basicResp
+            }
             throw RTSPError.authenticationFailed
           }
           guard retryResp.statusCode >= 200 && retryResp.statusCode < 300 else {
@@ -1345,6 +1352,43 @@ actor SessionState {
       )
     }
 
+    return resp
+  }
+
+  /// Retry once with Basic auth after a Digest retry was rejected by a server
+  /// that advertised both schemes. This handles cameras that claim Digest
+  /// support but only accept Basic for RTSP.
+  private func retryWithBasicFallback(
+    auth: inout RTSPAuthenticator,
+    method: RTSPMethod,
+    url: String,
+    extraHeaders: [(String, String)]
+  ) async throws -> RTSPResponse? {
+    guard let conn = connection,
+      let authHeader = auth.authorizeBasicFallback()
+    else { return nil }
+
+    var request = RTSPRequest(method: method, url: url)
+    request.setHeader("CSeq", value: "\(nextCSeq())")
+    if let userAgent = userAgent, !userAgent.isEmpty {
+      request.setHeader("User-Agent", value: userAgent)
+    }
+    if let sid = sessionId {
+      request.setHeader("Session", value: sid)
+    }
+    for (name, value) in extraHeaders {
+      request.setHeader(name, value: value)
+    }
+    request.setHeader("Authorization", value: authHeader)
+
+    let resp = try await conn.sendRequest(request)
+    if resp.statusCode == 401 {
+      return nil
+    }
+    guard resp.statusCode >= 200 && resp.statusCode < 300 else {
+      throw RTSPError.sessionSetupFailed(
+        statusCode: Int(resp.statusCode), reason: resp.reasonPhrase)
+    }
     return resp
   }
 

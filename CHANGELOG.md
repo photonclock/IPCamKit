@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.3.1
+
+### Fixes
+
+- Fall back to RTSP Basic authentication when a camera advertises both Digest
+  and Basic but rejects Digest. Fixes TP-Link RTSP servers that offer Digest
+  in `WWW-Authenticate` but only accept Basic for authenticated requests.
+
 ## 0.3.0
 
 ### Breaking changes
