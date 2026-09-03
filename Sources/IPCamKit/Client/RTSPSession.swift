@@ -57,7 +57,8 @@ public struct RTSPDiagnostic: Sendable {
 /// `codec` and `clockRate` are always populated. `sps`/`pps`/`vps`/`resolution`
 /// are `nil` until the depacketizer has observed parameter sets — for most
 /// cameras this happens in-band on the first packet; cameras that ship the
-/// parameter sets in SDP `fmtp` will have them set at `start()` time.
+/// parameter sets in SDP `fmtp` will have them set at `start()` time. `frameRate`
+/// may also be available at start from SDP `a=framerate`.
 public struct VideoStream: Sendable {
   public let codec: VideoCodec
   public let clockRate: UInt32
@@ -66,6 +67,8 @@ public struct VideoStream: Sendable {
   /// H.265 only; nil for H.264.
   public let vps: Data?
   public let resolution: (width: Int, height: Int)?
+  /// Source-reported frames per second, when valid and available.
+  public let frameRate: Double?
 }
 
 /// Audio stream details, surfaced when a supported audio stream is active.
@@ -267,6 +270,13 @@ public struct PublicVideoFrame: Sendable {
 
   /// VPS data if parameters changed with this frame (H.265 only).
   public let vps: Data?
+
+  /// Resolution if parameters changed with this frame and report dimensions.
+  public let resolution: (width: Int, height: Int)?
+
+  /// Source-reported frames per second if parameters changed with this frame
+  /// and contain valid VUI timing information.
+  public let frameRate: Double?
 }
 
 /// Dispatch enum for video depacketizers (H.264 or H.265).
@@ -304,6 +314,93 @@ enum VideoDepacketizer: Sendable {
     case .h265(let d): return d.parameters?.genericParameters
     }
   }
+
+  func publicVideoStream(clockRate: UInt32, sdpFrameRate: Float?) -> VideoStream {
+    let parameters = videoParameters
+    let dimensions = parameters?.pixelDimensions
+    let frameRate = validFrameRate(sdpFrameRate) ?? validFrameRate(parameters?.frameRate)
+
+    switch self {
+    case .h264(let depacketizer):
+      return VideoStream(
+        codec: .h264,
+        clockRate: clockRate,
+        sps: depacketizer.parameters?.spsNAL,
+        pps: depacketizer.parameters?.ppsNAL,
+        vps: nil,
+        resolution: dimensions.map { (width: Int($0.width), height: Int($0.height)) },
+        frameRate: frameRate
+      )
+    case .h265(let depacketizer):
+      return VideoStream(
+        codec: .h265,
+        clockRate: clockRate,
+        sps: depacketizer.parameters?.spsNAL,
+        pps: depacketizer.parameters?.ppsNAL,
+        vps: depacketizer.parameters?.vpsNAL,
+        resolution: dimensions.map { (width: Int($0.width), height: Int($0.height)) },
+        frameRate: frameRate
+      )
+    }
+  }
+
+  func publicVideoFrame(_ frame: VideoFrame) -> PublicVideoFrame {
+    // Split AVCC data into individual NALs.
+    var nalus: [Data] = []
+    var offset = frame.data.startIndex
+    while offset + 4 <= frame.data.endIndex {
+      let length =
+        Int(frame.data[offset]) << 24
+        | Int(frame.data[offset + 1]) << 16
+        | Int(frame.data[offset + 2]) << 8
+        | Int(frame.data[offset + 3])
+      offset += 4
+      if offset + length <= frame.data.endIndex {
+        nalus.append(Data(frame.data[offset..<(offset + length)]))
+      }
+      offset += length
+    }
+
+    let parameters = frame.hasNewParameters ? videoParameters : nil
+    let dimensions = parameters?.pixelDimensions
+    var sps: Data?
+    var pps: Data?
+    var vps: Data?
+    if frame.hasNewParameters {
+      switch self {
+      case .h264(let depacketizer):
+        sps = depacketizer.parameters?.spsNAL
+        pps = depacketizer.parameters?.ppsNAL
+      case .h265(let depacketizer):
+        sps = depacketizer.parameters?.spsNAL
+        pps = depacketizer.parameters?.ppsNAL
+        vps = depacketizer.parameters?.vpsNAL
+      }
+    }
+
+    return PublicVideoFrame(
+      nalus: nalus,
+      timestamp: frame.timestamp.elapsedSeconds,
+      isKeyframe: frame.isRandomAccessPoint,
+      loss: frame.loss,
+      sps: sps,
+      pps: pps,
+      vps: vps,
+      resolution: dimensions.map { (width: Int($0.width), height: Int($0.height)) },
+      frameRate: validFrameRate(parameters?.frameRate)
+    )
+  }
+}
+
+private func validFrameRate(_ value: Float?) -> Double? {
+  guard let value, value.isFinite, value > 0 else { return nil }
+  return Double(value)
+}
+
+private func validFrameRate(_ value: (num: UInt32, den: UInt32)?) -> Double? {
+  guard let value, value.num > 0, value.den > 0 else { return nil }
+  let framesPerSecond = Double(value.den) / Double(value.num)
+  return framesPerSecond.isFinite && framesPerSecond > 0 ? framesPerSecond : nil
 }
 
 // MARK: - Internal Session State
@@ -740,29 +837,10 @@ actor SessionState {
     // `depacketizer` and `videoClockRate` are set in lock-step inside the
     // video-init block above, so the outer `if let` enforces that invariant.
     let video: VideoStream?
-    if let depkt = depacketizer, let clockRate = videoClockRate {
-      switch depkt {
-      case .h264(let d):
-        let dims = d.parameters?.genericParameters.pixelDimensions
-        video = VideoStream(
-          codec: .h264,
-          clockRate: clockRate,
-          sps: d.parameters?.spsNAL,
-          pps: d.parameters?.ppsNAL,
-          vps: nil,
-          resolution: dims.map { (width: Int($0.width), height: Int($0.height)) }
-        )
-      case .h265(let d):
-        let dims = d.parameters?.genericParameters.pixelDimensions
-        video = VideoStream(
-          codec: .h265,
-          clockRate: clockRate,
-          sps: d.parameters?.spsNAL,
-          pps: d.parameters?.ppsNAL,
-          vps: d.parameters?.vpsNAL,
-          resolution: dims.map { (width: Int($0.width), height: Int($0.height)) }
-        )
-      }
+    if let depacketizer, let clockRate = videoClockRate, let videoStreamIndex {
+      video = depacketizer.publicVideoStream(
+        clockRate: clockRate,
+        sdpFrameRate: presMut.streams[videoStreamIndex].framerate)
     } else {
       video = nil
     }
@@ -1525,46 +1603,7 @@ actor SessionState {
   private func convertFrame(
     _ frame: VideoFrame, depacketizer: VideoDepacketizer
   ) -> PublicVideoFrame {
-    // Split AVCC data into individual NALs
-    var nalus: [Data] = []
-    var offset = frame.data.startIndex
-    while offset + 4 <= frame.data.endIndex {
-      let len =
-        Int(frame.data[offset]) << 24
-        | Int(frame.data[offset + 1]) << 16
-        | Int(frame.data[offset + 2]) << 8
-        | Int(frame.data[offset + 3])
-      offset += 4
-      if offset + len <= frame.data.endIndex {
-        nalus.append(Data(frame.data[offset..<(offset + len)]))
-      }
-      offset += len
-    }
-
-    var sps: Data?
-    var pps: Data?
-    var vps: Data?
-    if frame.hasNewParameters {
-      switch depacketizer {
-      case .h264(let d):
-        sps = d.parameters?.spsNAL
-        pps = d.parameters?.ppsNAL
-      case .h265(let d):
-        sps = d.parameters?.spsNAL
-        pps = d.parameters?.ppsNAL
-        vps = d.parameters?.vpsNAL
-      }
-    }
-
-    return PublicVideoFrame(
-      nalus: nalus,
-      timestamp: frame.timestamp.elapsedSeconds,
-      isKeyframe: frame.isRandomAccessPoint,
-      loss: frame.loss,
-      sps: sps,
-      pps: pps,
-      vps: vps
-    )
+    depacketizer.publicVideoFrame(frame)
   }
 
   private func publicAudioCodec(from encoding: String) -> PublicAudioCodec {

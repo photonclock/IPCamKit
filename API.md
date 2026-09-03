@@ -10,7 +10,7 @@ let session = RTSPClientSession(
   credentials: Credentials(username: "admin", password: "pass"))
 
 let desc = try await session.start()
-// desc.video?.codec / .resolution / .sps / .pps / .vps / .clockRate
+// desc.video?.codec / .resolution / .frameRate / .sps / .pps / .vps / .clockRate
 // desc.audio?.codec / .sampleRate / .channels / .extraData
 // desc.metadataEncoding (e.g. "vnd.onvif.metadata")
 
@@ -113,6 +113,7 @@ struct VideoStream: Sendable {
   let pps: Data?
   let vps: Data?                               // H.265 only
   let resolution: (width: Int, height: Int)?
+  let frameRate: Double?                       // source-reported frames per second
 }
 
 struct AudioStream: Sendable {
@@ -172,6 +173,8 @@ struct PublicVideoFrame: Sendable {
   let sps: Data?            // Non-nil when parameters change
   let pps: Data?
   let vps: Data?            // H.265 only
+  let resolution: (width: Int, height: Int)? // Non-nil on a parameter update with dimensions
+  let frameRate: Double?    // Non-nil on a parameter update with VUI timing
 }
 ```
 
