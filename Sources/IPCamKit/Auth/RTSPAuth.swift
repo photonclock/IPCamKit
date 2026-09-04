@@ -102,7 +102,11 @@ struct RTSPAuthenticator: Sendable {
     var nonce: String
     var qop: String?
     var opaque: String?
-    var algorithm: String
+    /// The exact algorithm token advertised by the server. A missing token
+    /// defaults the calculation to MD5, but must remain absent from the client
+    /// response for compatibility with RTSP servers that reject unsolicited
+    /// Digest parameters.
+    var algorithm: String?
     var nc: UInt32 = 0
   }
 
@@ -111,7 +115,7 @@ struct RTSPAuthenticator: Sendable {
     var nonce = ""
     var qop: String?
     var opaque: String?
-    var algorithm = "MD5"
+    var algorithm: String?
 
     for param in splitAuthParams(params) {
       let kv = param.split(separator: "=", maxSplits: 1)
@@ -145,8 +149,8 @@ struct RTSPAuthenticator: Sendable {
 
   /// Map an `algorithm` token to a hash family and the `-sess` flag. Unknown
   /// algorithms fall back to MD5 (RFC 7616's default).
-  private func parseAlgorithm(_ algorithm: String) -> (hash: DigestHash, sess: Bool) {
-    let lower = algorithm.lowercased()
+  private func parseAlgorithm(_ algorithm: String?) -> (hash: DigestHash, sess: Bool) {
+    let lower = (algorithm ?? "MD5").lowercased()
     let hash: DigestHash = lower.hasPrefix("sha-256") ? .sha256 : .md5
     return (hash, lower.hasSuffix("-sess"))
   }
@@ -184,7 +188,10 @@ struct RTSPAuthenticator: Sendable {
     // they are RFC tokens, not quoted-strings.
     var header =
       "Digest username=\(quote(credentials.username)), realm=\(quote(state.realm)), "
-      + "nonce=\(quote(state.nonce)), uri=\(quote(uri)), algorithm=\(state.algorithm)"
+      + "nonce=\(quote(state.nonce)), uri=\(quote(uri))"
+    if let algorithm = state.algorithm {
+      header += ", algorithm=\(algorithm)"
+    }
 
     if let qop = state.qop, qopOffersAuth(qop) {
       state.nc &+= 1

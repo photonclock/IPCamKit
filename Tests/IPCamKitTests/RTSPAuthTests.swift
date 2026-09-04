@@ -38,6 +38,34 @@ struct RTSPAuthTests {
     #expect(header!.contains("response=\""))
   }
 
+  @Test("Digest default MD5 calculation does not invent an algorithm field")
+  func digestDefaultMD5OmitsUnsolicitedAlgorithm() {
+    var auth = RTSPAuthenticator(
+      credentials: Credentials(username: "admin", password: "password"))
+    auth.handleChallenge(
+      "Digest realm=\"BC Streaming Media\", nonce=\"abc123\"")
+
+    let header = auth.authorize(
+      method: "DESCRIBE", uri: "rtsp://camera.invalid/stream")
+
+    #expect(header?.hasPrefix("Digest ") == true)
+    #expect(header?.contains("algorithm=") == false)
+    #expect(header?.contains("response=\"") == true)
+  }
+
+  @Test("Digest explicit MD5 algorithm remains in authorization")
+  func digestExplicitMD5IsPreserved() {
+    var auth = RTSPAuthenticator(
+      credentials: Credentials(username: "admin", password: "password"))
+    auth.handleChallenge(
+      "Digest realm=\"test\", nonce=\"abc123\", algorithm=MD5")
+
+    let header = auth.authorize(
+      method: "DESCRIBE", uri: "rtsp://camera.invalid/stream")
+
+    #expect(header?.contains("algorithm=MD5") == true)
+  }
+
   @Test("Digest auth from Longse unauthorized response")
   func longseDigestAuth() throws {
     let resp = try loadResponse("longse_unauthorized.txt")
